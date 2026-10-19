@@ -1,0 +1,16 @@
+# 压缩排队（@dongasai/dsh-compact-queue）
+#
+# 宿主层一行插件：为**每个 agent** 注册一条 agent 作用域命令 /compact_queue。
+# 核心 /compact 在会话非严格 idle 时只回一句 busy 错误就丢弃请求；本插件不碰核心，
+# 另开一条命令：空闲时立即压缩，忙时把请求排进本会话队列，等下一次 idle 自动补跑。
+#
+# 为什么放宿主层而不是 preset 行：
+#   插件 apply() 需要宿主层的 agents / agentPresets / commands 三个服务来
+#   「遍历并监听 agent 创建 → 在 agent.ctx 上注册命令 → 用 serviceFor(agent,'compaction')
+#   跨 realm 取预设里的压缩服务」。preset 行拿不到 agents 注册表，也看不到其它 agent。
+#
+# 命令的可见性与生命周期都由 agent.ctx.commands.register() 决定：只对该 agent 可见，
+# 随 agent scope 销毁自动卸载（本文件不需要也不应该做 per-agent 的重复注册）。
+- insert:
+    - id: dsh-compact-queue
+      name: '@dongasai/dsh-compact-queue'
