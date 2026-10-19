@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-19T20:46:08+0800",
+  "tool": "init-architect",
+  "repo": {
+    "root": ".",
+    "name": "@dongasai/dsh-compact-queue",
+    "version": "0.1.0",
+    "kind": "dsh-bundle-plugin",
+    "vcs": {
+      "type": "git",
+      "branch": "main",
+      "head": "29c6b52",
+      "tags": [],
+      "remotes": []
+    }
+  },
+  "inventory": {
+    "estimatedTotalFiles": 4,
+    "scannedFiles": 4,
+    "coverage": 1.0,
+    "truncated": false,
+    "languages": {
+      "JavaScript (ESM)": 1,
+      "JSON": 1,
+      "YAML": 1,
+      "Markdown": 1
+    },
+    "ignored": {
+      "policy": "default (no .gitignore in repo)",
+      "patterns": [
+        "node_modules/**",
+        ".git/**",
+        ".github/**",
+        "dist/**",
+        "build/**",
+        ".next/**",
+        "__pycache__/**",
+        "*.lock",
+        "*.log",
+        "*.bin",
+        "*.pdf",
+        "*.png",
+        "*.jpg",
+        "*.jpeg",
+        "*.gif",
+        "*.mp4",
+        "*.zip",
+        "*.tar",
+        "*.gz"
+      ],
+      "skippedTopDirs": [
+        { "path": ".git", "reason": "VCS metadata", "files": null }
+      ],
+      "emptyDirs": [
+        { "path": "locale", "reason": "空目录，git 不跟踪，无 i18n 资源" }
+      ]
+    }
+  },
+  "modules": [
+    {
+      "path": ".",
+      "name": "宿主插件 bundle（单模块仓）",
+      "docs": "AGENTS.md",
+      "language": "JavaScript (ESM)",
+      "entry": "index.js#apply(ctx)",
+      "entrySymbols": ["apply", "attach", "performCompact", "attempt", "notify"],
+      "exports": ["name", "inject", "apply"],
+      "interfaces": [
+        { "kind": "command", "name": "compact_queue", "scope": "agent", "registeredVia": "agent.ctx.commands.register()", "args": ["", "cancel"] },
+        { "kind": "cordis-patch", "path": "cordis.patch.yml", "insert": ["dsh-compact-queue"] }
+      ],
+      "injects": ["commands", "agents", "agentPresets"],
+      "externalServices": ["ctx.agents", "ctx.agentPresets.serviceFor(agent,'compaction')", "agent.inject", "ctx.logger"],
+      "constants": { "QUEUE_TICK_MS": 2000, "MAX_WAIT_MS": 1800000 },
+      "stateMachine": ["none", "queued", "running"],
+      "tests": { "present": false, "dirs": [], "framework": null },
+      "quality": { "eslint": false, "prettier": false, "other": [] },
+      "keyPaths": ["index.js", "cordis.patch.yml", "package.json", "README.md", "AGENTS.md"],
+      "profiles": [
+        { "profile": "web", "declaration": "link:/data/ai/dsh/dsh_compact_queue", "inBundles": true }
+      ]
+    }
+  ],
+  "gaps": [
+    { "area": "tests", "detail": "无任何自动化测试与测试脚本；状态机/timer 逻辑只有 README 的人工冒烟口径", "priority": "high" },
+    { "area": "quality", "detail": "无 lint / format 配置，编码规范仅由 AGENTS.md 文字约定", "priority": "low" },
+    { "area": "vcs", "detail": "无 remote（GitHub 三个候选名与内部 Gitea dsh/ 下均无同名仓库）；0.1 只能本地打 tag", "priority": "medium" },
+    { "area": "bugs", "detail": "① tick 通道命中 30 分钟超时静默取消（attempt(false) 不发 notice）；② attempt() 开头两次 isLive() 死代码", "priority": "medium" },
+    { "area": "i18n", "detail": "locale/ 为空目录，无 i18n 资源", "priority": "low" }
+  ],
+  "documents": [
+    { "path": "AGENTS.md", "scope": "root", "status": "created", "sections": ["项目愿景", "架构总览", "模块结构图(Mermaid)", "模块索引", "运行与开发", "测试策略", "编码规范", "AI 使用指引", "变更记录"] },
+    { "path": ".agents/index.json", "scope": "root", "status": "created" }
+  ],
+  "nextSteps": [
+    "为状态机补最小冒烟脚本或探针（排队/撤销/超时/agent 离场四条路径）",
+    "修 tick 超时静默取消：超时分支应不分通道都发 notice",
+    "确定远端仓库（GitHub 或内部 Gitea）后再补 push 与 tag 0.1 的远端核对"
+  ]
+}
