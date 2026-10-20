@@ -89,7 +89,7 @@ graph TD
 | 宿主插件 | [index.js](index.js) | 遍历/监听 agent，为每个 agent 注册 scoped 命令 `/compact_queue` 并维护排队状态机，压缩完成/失败以 notice 回执 | `apply(ctx)` → `attach(ctx, agent)` | 宿主层加载；attach 出的监听器/定时器随 agent scope 卸载 |
 | bundle 补丁 | [cordis.patch.yml](cordis.patch.yml) | `- insert:` 一行 `id: dsh-compact-queue`，把插件挂到宿主层 | — | profile 装载时读取 |
 | 包元数据 | [package.json](package.json) | `name` / `exports` / `files` / `dsh.bundle.patch`；`private: true`，不进 npm 公共源 | — | — |
-| 用户文档 | [README.md](README.md) | 装（三种通路 + 四条坑）、命令与回执原文对照表、结构/扩展点占用、排错、两层验证、已知边界 | — | — |
+| 用户文档 | [README.md](README.md) | 装（git 源 / `link:` + 四条坑）、命令与回执原文对照表、结构/扩展点占用、排错、两层验证、已知边界 | — | — |
 
 `locale/` 是空目录（git 不跟踪），当前没有 i18n 资源。
 
@@ -97,7 +97,7 @@ graph TD
 
 | 目的 | 做法 |
 |---|---|
-| 装进 profile | `dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1`（或开发用 `link:<仓库绝对路径>`），**再把包名追加进该 profile 的 `dsh.profile.bundles`** —— `dsh plugin` 只转发给 pnpm 改 dependencies，不会登记 bundles；当前 `~/.dsh/profiles/web/package.json` 已是 `"@dongasai/dsh-compact-queue": "link:/data/ai/dsh/dsh_compact_queue"` 且列在 bundles 里 |
+| 装进 profile | `dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1`（或开发用 `link:<仓库绝对路径>`），**再把包名追加进该 profile 的 `dsh.profile.bundles`** —— `dsh plugin` 只转发给 pnpm 改 dependencies，不会登记 bundles；当前 `~/.dsh/profiles/web/package.json` 是 `"@dongasai/dsh-compact-queue": "github:dongasai/dsh_compact_queue#0.1"`（2026-10-20 10:30 从 `link:` 切到 git 源，解析到 tag `0.1` 的提交 `79bc3f9`），本仓改动**不再**自动生效，要换回 `link:` 才能边改边试 |
 | 卸载 | `dsh plugin --profile web remove @dongasai/dsh-compact-queue`，并从 `dsh.profile.bundles` 删掉该包名，然后重启 |
 | 让改动生效 | **重启 `dsh web`**。宿主层插件，命令注册发生在 agent 创建时，热改不会给已有会话补注册；没有浏览器半边，不需要 `pnpm run dev:web` 之类的重建 |
 | 手工冒烟 | 在 dsh web 会话里敲 `/compact_queue` 看回执；忙时再敲一次应回「已排队」并在下一次 idle 自动补跑（摘要以折叠 notice 出现） |
@@ -136,6 +136,7 @@ timer 逻辑时至少覆盖这五条：
 
 ## 变更记录
 
+- **2026-10-20T11:05+08:00** 按插件 README 编写规范（`note/readme-spec.md` §2.3）重写 README 安装章节：改成「装 → 登记 bundles → 重启 → 确认」四步编号（每步带命令 + 期望输出），明说没有 registry 装法且插件市场搜不到，补「首次配置：没有」的「情况 → 显示 → 动作」表；`--dump-config` 期望输出改为本机实测三行；删掉重复的独立「确认它真的在工作」「生效条件」两节（并入第 3、4 步）。
 - **2026-10-20T10:05+08:00** 按「dsh 插件 README 编写经验」重写 README：补三种装法与四条坑（`--profile` 必填、`bundles` 清单必须手加、`github:` 前缀、tag 必须真实）、回执原文对照表、扩展点占用表、两层验证、已知边界逐条带原因与代价；同时纠正旧 README 的装法——`plugin_manager` 是桌面端内置工具，本环境没有，登记 bundles 也不会由 `dsh plugin` 代劳。
 - **2026-10-20T09:52+08:00** 远端落定：`origin` = `git@github.com:dongasai/dsh_compact_queue.git`（新建空仓，`git ls-remote` 无任何 ref）；附注 tag `0.1` 重挂到本提交后与 `main` 一并推送。
 - **2026-10-19T20:46+08:00** 初始化架构文档：新增本文件与 `.agents/index.json`；扫描覆盖 4/4 个被跟踪文件（100%）。无子模块，故不生成下级 `AGENTS.md`。
