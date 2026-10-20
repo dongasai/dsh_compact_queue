@@ -28,102 +28,87 @@
 
 不提供：跨会话全局队列、持久化队列、UI 面板、HTTP 路由。本包**没有浏览器半边**，只有 Host 半边。
 
-## 快速开始
+## 安装
 
-本插件**没有配置文件、没有界面、也没有 registry 装法**——`private: true` 且未发布到 npm。
-装它只有下面两条命令式通路，装完还要登记 `bundles` 并重启。四步做完即可用。
+三种装法，按场景选。**都走同一条 pnpm 路径**（`@deepseek-ai/dsh-plugin-manager/operations`，
+共用一把 profile 写锁），装完都会出现在侧栏「插件」页的**已安装**列表里。
 
-### 第 1 步：装（二选一）
+**都不需要手写注册行**：本包在 `package.json` 里声明了 `dsh.bundle.patch`，只要这个 bundle 被选中，
+生效的那一行就来自本包自带的 [cordis.patch.yml](cordis.patch.yml)。命令行（方式二、三）安装会顺带把它
+选进 `dsh.profile.bundles`；Web 上（方式一）是装完点 **立即启用** 才选中 —— 不点就只是「装着但没启用」。
 
-| 装法 | 适用 | 命令 |
-| --- | --- | --- |
-| git 源（发布版） | 日常使用；装的是 **tag 指向的那个提交**（`0.1` → `79bc3f9`），不是工作区 | `dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1` |
-| `link:` 本地目录 | 要在本仓改代码、改完重启就见效 | `dsh plugin --profile web add link:<仓库绝对路径>` |
+本包 `private: true`、未发布到 npm，所以没有「按包名从 registry 装」这条路：spec 要么是本地路径，
+要么是 git 地址。
 
-Web 界面里的插件市场（`dsh-plugin`）按 **npm 包**分发，本包未发布，**市场里搜不到**，别在那儿找。
+### 方式一：Web 界面（推荐）
 
-装完依赖的位置应变成这样：
+DSH Web → 左侧栏 **插件** → **添加插件** → 填入本仓库绝对路径（或下面的 git 地址）→ **安装** →
+装完点 **立即启用**。
 
-```bash
-grep -n 'dsh-compact-queue' ~/.dsh/profiles/web/package.json
-# 7:    "@dongasai/dsh-compact-queue": "github:dongasai/dsh_compact_queue#0.1",
-```
+仓库地址：https://github.com/dongasai/dsh_compact_queue
 
-刚装完只有这一行——`dsh.profile.bundles` 里还没有它，第 2 步补上后才会变成两行。
+- 「添加插件」接受：包名（可带版本）、Git 地址、压缩包、**本地绝对路径**。
+- 装完不点**立即启用**，就只是「装着但没启用」。
+- 侧栏这个「插件」页才能装和开关；**设置 → 内置插件** 里的清单是只读的。
 
-**四条通用坑**，装错时按顺序对：
-
-1. **`--profile` 必填**，且必须与你要用的 app 一致。装进 `headless` 却在 `web` 里找命令，界面上一个字都看不到。
-2. **只加依赖、不加 `dsh.profile.bundles` = 装了不挂载**。`dsh plugin` 只把参数转发给 profile 目录里的 pnpm，不碰 bundles 清单；宿主启动时按清单加载，清单里没有就永远不加载。
-3. **git 规格必须带 `github:` 或 `git+` 前缀**。照抄仓库页面的 `git@github.com:dongasai/…`（scp 写法）会被 pnpm 当成本地路径，装出一条死的 `link:` 依赖。
-4. **钉版本的 tag 必须真实存在**。本仓库当前 tag 是 `0.1`（附注标签，指向提交 `79bc3f9`），用 `git ls-remote --tags origin` 核对；写不存在的 tag 会在 pnpm 解析阶段直接报错。
-
-### 第 2 步：登记 `dsh.profile.bundles`（必做）
-
-编辑 `~/.dsh/profiles/web/package.json`，把包名追加到 `dsh.profile.bundles` 数组末尾
-（数组顺序就是层序，放最后即最上层）：
-
-```jsonc
-// ~/.dsh/profiles/web/package.json
-{
-  "dsh": {
-    "profile": {
-      "bundles": [
-        "@deepseek-ai/dsh-base",
-        "…原有各项…",
-        "@dongasai/dsh-compact-queue"   // ← 追加这一行
-      ]
-    }
-  }
-}
-```
-
-核对——此时应变成两行（一条在 `dependencies`、一条在 `dsh.profile.bundles`）：
+### 方式二：命令行 · git 源（分发）
 
 ```bash
-grep -n 'dsh-compact-queue' ~/.dsh/profiles/web/package.json
-# 7:    "@dongasai/dsh-compact-queue": "github:dongasai/dsh_compact_queue#0.1",
-# 70:        "@dongasai/dsh-compact-queue"
+dsh plugin --profile web add github:dongasai/dsh_compact_queue
+# 或
+dsh plugin --profile web add git+https://github.com/dongasai/dsh_compact_queue.git
+# 钉版本（URL 后加 #<tag>，锁到某个发布版本来复现问题 / 稳定使用）
+dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1
 ```
 
-行号随你的 profile 里装了多少插件而变，看的两件事是：**依赖里有、bundles 里也有**。
+`dsh plugin --profile <name> <pnpm args>` 把参数交给
+`@deepseek-ai/dsh-plugin-manager/operations`（底层仍是该 profile 目录里的 pnpm）。装进来的是
+**副本**：之后改本仓库代码不影响已装的副本（想边改边用就走方式三）。
 
-### 第 3 步：重启
+- `--profile` **必填**（不写直接报 `required option '--profile <name> not specified'`）。
+- **必须带 `git+` 或 `github:` 前缀**。`git@github.com:owner/repo.git` 这种 scp 写法不会被认成
+  git spec，pnpm 会把它当路径，装出一条指向不存在目录的 `link:` 死链。
+- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.1`），tag / 分支 / commit 都行；
+  本仓库当前 tag 是 `0.1`，对应 `package.json` 的 `0.1.0` —— 不带 `#` 则跟 `main` 走，
+  每次装到的都可能是新代码。
+- pnpm 默认会拦 `prepare` 等依赖构建脚本；本包**没有任何构建步骤**（纯 ESM 源码 + 一个 cordis
+  补丁，没有编译产物），不会遇到。
 
-**必须重启 `dsh web`**：本包只有 Host 半边，没有浏览器半边可刷新，也没有 HMR 监视它。
-命令注册发生在 agent 创建时，所以重启前已存在的会话拿不到新命令，刷新页面同样无效。
-
-### 第 4 步：确认它真的在工作
+### 方式三：命令行 · 本地目录（link，开发）
 
 ```bash
-dsh --profile web --dump-config | grep -A2 '# == @dongasai/dsh-compact-queue'
+dsh plugin --profile web add link:<本仓库绝对路径>
 ```
 
-期望输出（本机实测，2026-10-20）：
+装成 `link:` 依赖，代码改动立刻是「已装的那份」—— 适合边改插件边用。
 
+- 改 [index.js](index.js) 或 [cordis.patch.yml](cordis.patch.yml)：**要重启 Harness** 才生效。
+- 本包**只有 Host 半边**（没有 `client.js`、没有浏览器 bundle），刷新页面不解决任何问题。
+
+### 装完确认
+
+命令行可以直接看合成后的 profile 树（不启动服务）：
+
+```bash
+dsh --profile web --dump-config | grep -A1 dsh-compact-queue
 ```
+
+期望看到（本机实测，2026-10-20）：
+
+```yaml
 # == @dongasai/dsh-compact-queue
 - id: dsh-compact-queue
   name: '@dongasai/dsh-compact-queue'
 ```
 
-搜不到这一段，说明第 2 步没生效。命令本身报 `EROFS` 说明 profile 目录不可写——`--dump-config` 要把
-组合结果写回该 profile 的 `cordis.yml`，这只影响这一步，不影响插件。
+**运行中的实例要重启才会加载它**（插件行是启动时合成的）：
 
-再到会话里敲 `/compact_queue`，出现任意一句回执即为注册成功。报「未知命令」= 第 3 步没做，或第 2 步漏了。
-行为对不对按这三条看：idle 时立即出 `压缩完成：…`；忙时回「已排队」；本轮结束后收到折叠的
-`排队压缩完成：…`。
+```bash
+systemctl --user restart dsh.service     # 按你的部署方式替换
+```
 
-### 首次配置：没有
-
-本插件零配置，装完即用。装错时的表现与处置：
-
-| 情况 | 界面显示 | 你要做什么 |
-| --- | --- | --- |
-| 装进了别的 profile（如 `headless`） | 当前会话里 `/compact_queue` 不存在，但那个 profile 的 `package.json` 里有包名 | 对 `web` 重做第 1、2 步，再重启 |
-| 漏了 bundles 登记 | 命令不存在；第 4 步 `grep` 搜不到 `dsh-compact-queue` | 补第 2 步，重启 |
-| 登记了但没重启 | 老会话里没有，新开的会话里有 | 重启 `dsh web` |
-| 装的是旧 tag | 命令能用，但回执文案/行为与本文不符 | 换新 tag 重装，或改 `link:` 指向本仓 |
+重启后在会话里敲 `/compact_queue`：出现任意一句回执即注册成功。报「未知命令」= 没重启，或装进了
+别的 profile（命令作用域跟着 agent 走，别的 profile 里看不到）。
 
 ### 卸
 
@@ -131,8 +116,7 @@ dsh --profile web --dump-config | grep -A2 '# == @dongasai/dsh-compact-queue'
 dsh plugin --profile web remove @dongasai/dsh-compact-queue
 ```
 
-再把包名从 `dsh.profile.bundles` 里删掉，然后重启。只 remove 依赖、留着 bundles 条目，
-下次启动会因为找不到包而告警。
+卸载时插件管理会把它从 `dsh.profile.bundles` 里一并摘掉；重启后命令消失。
 
 ## 用法
 
@@ -225,7 +209,7 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| 命令补全里没有 `/compact_queue` | 没重启；或包名不在 `dsh.profile.bundles`；或装到了别的 profile | 按「快速开始」第 1~4 步依次核 |
+| 命令补全里没有 `/compact_queue` | 没重启；或 Web 上装了没点「立即启用」；或装到了别的 profile | 按「安装 → 装完确认」逐条核：`dsh --profile web --dump-config \| grep -A1 dsh-compact-queue` 有没有那三行 |
 | 一直回「已排队」不下去 | 会话确实一直被占用（长任务、subagent、其它 maintenance 占着） | 等本轮结束；或 `/compact_queue cancel` 撤销 |
 | 回「本会话挂载的 agent preset 没有提供 compaction 服务」 | 当前 preset 没挂 compaction 实现 | 换回带压缩的 preset；这不是排队逻辑的问题 |
 | 排队到 30 分钟突然消失、没有任何提示 | tick 通道命中超时的已知静默缺陷 | 见「已知边界」第 3 条 |
@@ -239,9 +223,9 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 ```bash
 node --check index.js                                        # 语法：无输出即通过
 npm pack --dry-run                                           # 应恰好 4 个文件（index.js / cordis.patch.yml / package.json / README.md）
-grep -n 'dsh-compact-queue' ~/.dsh/profiles/web/package.json  # 两行：dependencies + dsh.profile.bundles
+grep -n 'dsh-compact-queue' ~/.dsh/profiles/web/package.json  # 两行：dependencies + dsh.profile.bundles（安装时自动登记）
 git ls-remote --tags origin                                  # 当前应看到 0.1 及其指向的提交
-dsh --profile web --dump-config | grep -A2 '# == @dongasai/dsh-compact-queue'   # 期望三行，见「快速开始」第 4 步
+dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # 期望三行，见「装完确认」
 ```
 
 只能在会话里打勾的（没有自动化测试，逐条手验）：
