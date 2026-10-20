@@ -1,29 +1,38 @@
 /**
  * @module @dongasai/dsh-compact-queue
  *
- * **agent 作用域命令 `/compact_queue`：压缩排队。**
+ * **命令 `/compact_queue`：压缩排队。**
  *
  * 核心 `/compact`（@deepseek-ai/dsh-command-compact）在会话忙时只回一句
  * busy 错误就丢弃请求。本插件不改核心，另注册一条命令：空闲时立即压缩，
  * 忙时把请求排在**本会话**队列里，等下一次 idle 自动补跑。
  *
- * ## 一、为什么必须挂在 agent 作用域
+ * ## 一、命令在宿主层全局注册，状态机按 agent 分流
  *
- * `compactNow` 要求「严格 idle 的 agent」（dsh-agent-loop `runMaintenance`：
- * 非 idle 直接 throw，外层包成 ManualCompactionError('busy')），排队必须
- * 盯住**这一个 agent** 的 status 翻转，而不是全局某个会话。两条官方接缝：
+ * 曾经想用 `agent.ctx.commands.register()` 让命令只对单个 agent 可见，
+ * 实测行不通：宿主层插件拿到的 `agent.ctx` 是
+ * `createScope(loopCtx, agent)` 产出的 scope context（dsh-agent-loop 构造函数
+ * `this.scope = createScope(loopCtx, this)`），它的 backing fiber 是一个
+ * 没有任何 `inject` 的占位插件。Cordis 的服务解析从该 fiber 沿父链逐级查
+ * `fiber.store[prop]`（cordis `ReflectService.handler.get`），而 `commands`
+ * 服务注册在宿主另一条分支上，不在这条链里——于是取属性直接抛
+ * `cannot get property "commands" without inject`。dsh-commands 里那句
+ * 「per-agent variant 请 mount 到 agent.ctx」对**宿主层**插件是空头支票：
+ * 要能解析服务，得先能拿到服务。
  *
- *   - **scoped 命令注册**：`ctx.commands.register()` 走 Cordis service
- *     tracing，经 `agent.ctx.commands.register()` 调用时注册进该 agent 的
- *     scoped layer（dsh-commands/lib/index.js 的 `layers.effect(this.ctx,…)`），
- *     只对这一个 agent 可见，且随 agent scope 的销毁自动卸载——CommandLayer
- *     构造器的报错文案就写着「per-agent variant, mount a command-injected
- *     plugin under that agent's `agent.ctx`」。
- *   - **跨 realm 取压缩服务**：compaction 实现挂在 preset 的 isolate realm
- *     里，host-plane 行 `inject` 不到（注入在任何会话存在之前就完成，没有
- *     agent 可作键）。宿主侧「已经持有 agent」的调用方用
- *     `ctx.agentPresets.serviceFor(agent, 'compaction')` 寻址——registry 源码
- *     注释（serviceForAgent）明确这就是它的用途。拿不到就如实报错，不猜。
+ * 所以命令走宿主 ctx 的**全局注册**，与核心 `/compact`、`/permission`、
+ * `/plan-mode` 同一形制；agent 维度不靠注册作用域，靠 handler 的
+ * `invocation.agent`（dsh-commands 构造 invocation 时必带 agent）落到该
+ * agent 自己的状态机。排队语义因此仍然严格按会话隔离。
+ *
+ * **跨 realm 取压缩服务**：compaction 实现挂在 preset 的 isolate realm 里，
+ * 宿主层 `inject` 不到（注入发生在任何会话存在之前，没有 agent 可作键）。
+ * 宿主侧「已经持有 agent」的调用方用
+ * `ctx.agentPresets.serviceFor(agent, 'compaction')` 寻址——registry 源码注释
+ * （serviceForAgent）明确这就是它的用途。拿不到就如实报错，不猜。
+ *
+ * `agent/status` 监听与 timer 仍然挂在 `agent.ctx` 上：`on` / `effect` 是
+ * Context 自身的成员，不触发服务解析，可用，且随 agent scope 销毁自动卸载。
  *
  * ## 二、排队怎么触发（事件 + tick 双保险）
  *
@@ -68,7 +77,10 @@ const FAILURE_TEXT = {
 	persistence: '压缩已完成，但会话未能保存。',
 };
 
-/** 一次排队请求在一个 agent 上的完整状态机。所有注册都走 agent.ctx，随 scope 卸载。 */
+/**
+ * 一个 agent 的完整状态机。
+ * 返回该 agent 的命令执行入口；监听器/timer 挂在 agent.ctx 上，随 scope 卸载。
+ */
 function attach(ctx, agent) {
 	/** 'none' | 'queued' | 'running'（running 只在 attempt 的 await 窗口内设置） */
 	let state = 'none';
@@ -190,8 +202,7 @@ function attach(ctx, agent) {
 		notify(`排队压缩失败：${outcome.text}`, '排队压缩失败');
 	}
 
-	// idle 事件 + tick 双保险（见文件头「二」）。listener/timer 都在 agent.ctx 上，
-	// agent scope 销毁时由 Cordis 统一卸载。
+	// idle 事件 + tick 双保险（见文件头「二」）。
 	agent.ctx.on('agent/status', ({ status }) => {
 		if (status === 'idle' && state === 'queued') void attempt(true);
 	});
@@ -200,82 +211,99 @@ function attach(ctx, agent) {
 		watcher = undefined;
 	}, 'compact-queue watch');
 
-	agent.ctx.commands.register({
-		definitionId: CommandDefinitionId('@dongasai/dsh-compact-queue'),
-		name: 'compact_queue',
-		description: 'Compact now, or queue the compaction until this session next goes idle',
-		handler: async (invocation) => {
-			const input = invocation.rawInput.trim();
-			if (input === 'cancel') {
-				if (state === 'queued') {
-					stopQueue();
-					return { kind: 'success', text: '已撤销排队的压缩。' };
-				}
-				if (running && activeAbort !== undefined) {
-					activeAbort.abort();
-					return { kind: 'success', text: '正在取消执行中的压缩。' };
-				}
-				return { kind: 'error', text: '当前没有排队的压缩。' };
-			}
-			if (input !== '') return { kind: 'error', text: USAGE };
-			if (running || state === 'running') return { kind: 'error', text: '压缩正在执行中。' };
-			if (state === 'queued') {
-				const waitedMin = Math.max(1, Math.round((Date.now() - enqueuedAt) / 60000));
-				return { kind: 'error', text: `压缩已在队列中（已排队约 ${waitedMin} 分钟）。/compact_queue cancel 可撤销。` };
-			}
-			// 乐观排队后立刻试一次：busy 时队列已经就位，省去二次竞态判定。
-			state = 'queued';
-			enqueuedAt = Date.now();
-			startWatch();
-			running = true;
-			let outcome;
-			try {
-				outcome = await performCompact(invocation.signal);
-			} finally {
-				running = false;
-			}
-			if (outcome.kind === 'busy') {
-				return {
-					kind: 'success',
-					text: `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 ${Math.round(MAX_WAIT_MS / 60000)} 分钟）。/compact_queue cancel 可撤销。`,
-				};
-			}
-			stopQueue();
-			if (outcome.kind === 'done') {
-				const { shadowedSeqs, shadowedTokenCount, summarySeq } = outcome.result;
-				return {
-					kind: 'success',
-					text: `压缩完成：${shadowedSeqs.length} 条历史（约 ${shadowedTokenCount} tokens）。`,
-					sourceEventSeq: summarySeq,
-				};
-			}
-			if (outcome.kind === 'empty') return { kind: 'success', text: '当前没有可压缩的历史。' };
-			return { kind: 'error', text: outcome.text };
-		},
-	});
-
 	// agent 离场即收摊（timer/status 随 scope 卸载，这里只兜住执行中的 abort 与状态）。
 	const dispose = () => {
 		if (activeAbort !== undefined) activeAbort.abort();
 		stopQueue();
 	};
 	agent.ctx.effect(dispose, 'compact-queue teardown');
+
+	/** 该 agent 的命令入口（由宿主层唯一的全局命令按 invocation.agent 分派进来）。 */
+	return async function runCommand(invocation) {
+		const input = invocation.rawInput.trim();
+		if (input === 'cancel') {
+			if (state === 'queued') {
+				stopQueue();
+				return { kind: 'success', text: '已撤销排队的压缩。' };
+			}
+			if (running && activeAbort !== undefined) {
+				activeAbort.abort();
+				return { kind: 'success', text: '正在取消执行中的压缩。' };
+			}
+			return { kind: 'error', text: '当前没有排队的压缩。' };
+		}
+		if (input !== '') return { kind: 'error', text: USAGE };
+		if (running || state === 'running') return { kind: 'error', text: '压缩正在执行中。' };
+		if (state === 'queued') {
+			const waitedMin = Math.max(1, Math.round((Date.now() - enqueuedAt) / 60000));
+			return { kind: 'error', text: `压缩已在队列中（已排队约 ${waitedMin} 分钟）。/compact_queue cancel 可撤销。` };
+		}
+		// 乐观排队后立刻试一次：busy 时队列已经就位，省去二次竞态判定。
+		state = 'queued';
+		enqueuedAt = Date.now();
+		startWatch();
+		running = true;
+		let outcome;
+		try {
+			outcome = await performCompact(invocation.signal);
+		} finally {
+			running = false;
+		}
+		if (outcome.kind === 'busy') {
+			return {
+				kind: 'success',
+				text: `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 ${Math.round(MAX_WAIT_MS / 60000)} 分钟）。/compact_queue cancel 可撤销。`,
+			};
+		}
+		stopQueue();
+		if (outcome.kind === 'done') {
+			const { shadowedSeqs, shadowedTokenCount, summarySeq } = outcome.result;
+			return {
+				kind: 'success',
+				text: `压缩完成：${shadowedSeqs.length} 条历史（约 ${shadowedTokenCount} tokens）。`,
+				sourceEventSeq: summarySeq,
+			};
+		}
+		if (outcome.kind === 'empty') return { kind: 'success', text: '当前没有可压缩的历史。' };
+		return { kind: 'error', text: outcome.text };
+	};
 }
 
 export function apply(ctx) {
 	const attached = new WeakSet();
+	/** agent → 该 agent 的命令入口；命令全局唯一，具体状态按 invocation.agent 取。 */
+	const machines = new WeakMap();
+
 	const maybeAttach = (agent) => {
-		if (attached.has(agent) || !isLive(ctx, agent)) return;
+		if (attached.has(agent) || !isLive(ctx, agent)) return undefined;
 		attached.add(agent);
 		try {
-			attach(ctx, agent);
+			const run = attach(ctx, agent);
+			machines.set(agent, run);
+			return run;
 		} catch (error) {
 			ctx.logger.warn('compact-queue: attach failed for %s: %o', agent?.id, error);
+			return undefined;
 		}
 	};
+
 	for (const agent of ctx.agents.list()) maybeAttach(agent);
 	ctx.on('agent/created', ({ agent }) => {
 		maybeAttach(agent);
+	});
+
+	// 宿主层全局注册（见文件头「一」）。disposer 由 Cordis 挂在插件 fiber 上。
+	ctx.commands.register({
+		definitionId: CommandDefinitionId('@dongasai/dsh-compact-queue'),
+		name: 'compact_queue',
+		description: 'Compact now, or queue the compaction until this session next goes idle',
+		handler: (invocation) => {
+			const run = machines.get(invocation.agent) ?? maybeAttach(invocation.agent);
+			if (run === undefined) {
+				return { kind: 'error', text: '本会话的压缩排队状态机尚未就绪，请重新发送一次。' };
+			}
+			return run(invocation);
+		},
 	});
 }
 
