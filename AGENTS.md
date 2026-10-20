@@ -36,9 +36,9 @@ apply(ctx)                            ← 宿主 ctx，拿得到 agents / agentP
   └─ on('agent/created') ─┴─► maybeAttach(agent)   (WeakSet 去重 + isLive 复核)
                                  │
                                  ▼
-                        attach(ctx, agent)          ← 每个 agent 一份，所有注册挂在 agent.ctx
+                        attach(ctx, agent)          ← 每个 agent 一份状态机，监听/定时器挂在 agent.ctx
                           ├─ 状态机 state: none | queued | running（+ running 布尔锁）
-                          ├─ agent.ctx.commands.register({ name: 'compact_queue' })   ← scoped 命令
+                          ├─ 返回该 agent 的 runCommand()，由宿主层唯一的全局命令按 invocation.agent 分派
                           ├─ agent.ctx.on('agent/status') → idle 翻转时 attempt(true)
                           ├─ setInterval(2s).unref()      → attempt(false)   ← 兜底 tick
                           ├─ performCompact() → ctx.agentPresets.serviceFor(agent,'compaction')
@@ -50,7 +50,7 @@ apply(ctx)                            ← 宿主 ctx，拿得到 agents / agentP
 
 | 接缝 | 用法 | 为什么 |
 |---|---|---|
-| scoped 命令注册 | `agent.ctx.commands.register()` | 走 Cordis service tracing，注册进该 agent 的 scoped layer，只对它可见，随 agent scope 销毁自动卸载。在根 `ctx` 注册会全局可见 |
+| 全局命令注册 | `ctx.commands.register()`（宿主 ctx，只注册一次） | **不能**用 `agent.ctx.commands`：agent scope 的 backing fiber 无 `inject`，`commands` 不在其 fiber 祖先链上，取属性直接抛 `cannot get property "commands" without inject`。命令全局注册，agent 维度由 handler 收到的 `invocation.agent` 决定 |
 | 跨 realm 取服务 | `ctx.agentPresets.serviceFor(agent, 'compaction')` | compaction 挂在 preset 的 isolate realm，宿主层 `inject` 不到（注入发生在任何会话存在之前）。取不到就如实报错，不猜 |
 | notice 注入 | `agent.inject(createUserMessage({ source: { kind:'compact-queue', form:'notice' } }))` | 与 `dsh-tool-jobs` 的完成通知同形制；不冒充 `kind:'user'`，不唤醒模型 |
 
@@ -86,7 +86,7 @@ graph TD
 
 | 模块 | 路径 | 职责 | 入口 | 生命周期 |
 |---|---|---|---|---|
-| 宿主插件 | [index.js](index.js) | 遍历/监听 agent，为每个 agent 注册 scoped 命令 `/compact_queue` 并维护排队状态机，压缩完成/失败以 notice 回执 | `apply(ctx)` → `attach(ctx, agent)` | 宿主层加载；attach 出的监听器/定时器随 agent scope 卸载 |
+| 宿主插件 | [index.js](index.js) | 在宿主层注册全局命令 `/compact_queue`（一次），为每个 agent 维护独立的排队状态机，压缩完成/失败以 notice 回执 | `apply(ctx)` → `attach(ctx, agent)` | 宿主层加载；attach 出的监听器/定时器随 agent scope 卸载 |
 | bundle 补丁 | [cordis.patch.yml](cordis.patch.yml) | `- insert:` 一行 `id: dsh-compact-queue`，把插件挂到宿主层 | — | profile 装载时读取 |
 | 包元数据 | [package.json](package.json) | `name` / `exports` / `files` / `dsh.bundle.patch`；`private: true`，不进 npm 公共源 | — | — |
 | 用户文档 | [README.md](README.md) | 安装（Web / git 源 / `link:` 三种装法 + 装完确认 + 卸）、命令与回执原文对照表、结构/扩展点占用、排错、两层验证、已知边界 | — | — |
@@ -97,9 +97,9 @@ graph TD
 
 | 目的 | 做法 |
 |---|---|
-| 装进 profile | 三条通路：Web 插件页「添加插件」→ 点「立即启用」；`dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1`；`link:<仓库绝对路径>`。`dsh plugin` 现在走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 把声明了 `dsh.bundle` 的包自动选进 `dsh.profile.bundles`，**不需要手写注册行**；当前 web profile 是 `"@dongasai/dsh-compact-queue": "github:dongasai/dsh_compact_queue#0.1"`（2026-10-20 10:30 从 `link:` 切到 git 源，解析到 tag `0.1` 的提交 `79bc3f9`），本仓改动**不再**自动生效 |
+| 装进 profile | 三条通路：Web 插件页「添加插件」→ 点「立即启用」；`dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1`；`link:<仓库绝对路径>`。`dsh plugin` 现在走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 把声明了 `dsh.bundle` 的包自动选进 `dsh.profile.bundles`，**不需要手写注册行**；当前 web profile 是 `"@dongasai/dsh-compact-queue": "file:…/profiles/web/.local-pkgs/dongasai-dsh-compact-queue-0.1.0.tgz"`（2026-10-20 14:25 打的 tarball，装成 `node_modules/@dongasai/…` 真实目录），本仓改动**不再**自动生效。**别用 `link:`**：链接包只有真身目录被解析，裸导入 `@deepseek-ai/*` 在 `dsh` 之外的进程里解析不到（`dsh` 自己启动时能路由，但那样装过一次后无法用普通 node 复核）；tarball / git 源装出来的真实目录才能稳定加载 |
 | 卸载 | `dsh plugin --profile web remove @dongasai/dsh-compact-queue`；`reconcile()` 会把它从 `dsh.profile.bundles` 一并摘掉，重启后命令消失 |
-| 让改动生效 | **重启 `dsh web`**。宿主层插件，命令注册发生在 agent 创建时，热改不会给已有会话补注册；没有浏览器半边，不需要 `pnpm run dev:web` 之类的重建 |
+| 让改动生效 | **重启 `dsh web`**。命令在 `apply()` 里全局注册一次；模块按已解析 URL 进 ESM 缓存，`plugin_manager` 关→开**不会**重新 import，热改一律不生效。没有浏览器半边，不需要 `pnpm run dev:web` 之类的重建。验证装对了：`dsh --profile web --no-open --port 0` 起一个临时实例，看它能否加载该行，再杀掉，别动正在跑的服务 |
 | 手工冒烟 | 在 dsh web 会话里敲 `/compact_queue` 看回执；忙时再敲一次应回「已排队」并在下一次 idle 自动补跑（摘要以折叠 notice 出现） |
 | 依赖安装 | **不要 `npm install`**，也**不要在本目录建 `node_modules`**：源码是原始 ESM、裸导入 `@deepseek-ai/*`，由 DSH profile resolver 路由到安装内副本。直接 `node index.js` 跑不起来是预期行为 |
 
@@ -127,7 +127,7 @@ timer 逻辑时至少覆盖这五条：
 
 ## AI 使用指引
 
-- **注册位置是硬约束**：命令只经 `agent.ctx.commands.register()` 注册，永远不要在根 `ctx` 上注册；监听器/定时器/teardown 一律走 `agent.ctx.effect(...)`，否则 agent 销毁后泄漏。
+- **注册位置是硬约束**：命令只在宿主 `ctx.commands.register()` 上注册一次，agent 维度靠 `invocation.agent` 分流——`agent.ctx.commands` 在宿主层插件里必然抛错（见上表）。但监听器/定时器/teardown 仍走 `agent.ctx.on/effect`：那是 Context 自身成员，不触发服务解析，且随 agent scope 卸载。
 - **改队列逻辑前先读 `attempt()` 全文**：`state`、`running`、`activeAbort`、`watcher` 四个变量互相牵制，只改一条通道（status 或 tick）会破坏「不重叠」保证。
 - **别顺手"优化"乐观排队**：handler 先置 `queued` 再立刻试一次是刻意设计——省掉二次竞态判定，代价只是忙时多一次无副作用调用。
 - **两条已知问题在 README 末尾有账**：① tick 通道命中 30 分钟超时是静默取消（`attempt(false)` 不发 notice）；② `attempt()` 开头连续两次 `isLive()` 属死代码。修任一条要同步更新 README 的「已知边界」。
@@ -136,6 +136,7 @@ timer 逻辑时至少覆盖这五条：
 
 ## 变更记录
 
+- **2026-10-20T14:35+08:00** 修「命令从未注册」：`agent.ctx.commands.register()` 在宿主层插件里必抛 `cannot get property "commands" without inject`（agent scope 的 backing fiber 无 inject，`commands` 不在其 fiber 祖先链上），改为宿主 `ctx.commands.register()` 全局注册一次 + handler 按 `invocation.agent` 分流状态机；profile 改用本地 tarball 装成真实目录。README 的「仅本会话可见」与扩展点表同步改写。
 - **2026-10-20T11:15+08:00** 安装章节按 gitea README 的写法重写：恢复「Web 界面装法」（插件页 → 添加插件 → 立即启用，第六版误判为不存在）、删掉「必须手写 `dsh.profile.bundles`」的错误步骤（`dsh plugin` 已走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 自动选中 bundle）、补齐「副本 vs `link:`」区别、无构建步骤说明、装完 `--dump-config | grep -A1` 的实测三行输出与 `systemctl --user restart dsh.service` 提示。
 - **2026-10-20T11:05+08:00** 按插件 README 编写规范（`note/readme-spec.md` §2.3）重写 README 安装章节：改成「装 → 登记 bundles → 重启 → 确认」四步编号（每步带命令 + 期望输出），明说没有 registry 装法且插件市场搜不到，补「首次配置：没有」的「情况 → 显示 → 动作」表；`--dump-config` 期望输出改为本机实测三行；删掉重复的独立「确认它真的在工作」「生效条件」两节（并入第 3、4 步）。
 - **2026-10-20T10:05+08:00** 按「dsh 插件 README 编写经验」重写 README：补三种装法与四条坑（`--profile` 必填、`bundles` 清单必须手加、`github:` 前缀、tag 必须真实）、回执原文对照表、扩展点占用表、两层验证、已知边界逐条带原因与代价；同时纠正旧 README 的装法——`plugin_manager` 是桌面端内置工具，本环境没有，登记 bundles 也不会由 `dsh plugin` 代劳。

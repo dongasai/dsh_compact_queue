@@ -6,7 +6,7 @@
 直接 throw，外层包成 `ManualCompactionError('busy')`，命令层把它原样转成一句报错就完事。
 会话正忙（上一轮还没收尾、maintenance 还没跑完）时想压一下历史，只能等、只能反复敲。
 
-本插件**不改核心**，另注册一条 **agent 作用域**命令：空闲时立刻压缩；忙时把请求排进**本会话**
+本插件**不改核心**，另注册一条命令 `/compact_queue`：空闲时立刻压缩；忙时把请求排进**本会话**
 队列，等这个会话下一次 idle 自动补跑；排队中随时能撤销。
 
 | 文档 | 只写 | 不写 |
@@ -24,7 +24,7 @@
 | 自动补跑 | 本会话下一次 idle 触发；`agent/status` 翻转与 2 秒兜底 tick 双通道，不漏触发、不重叠执行 |
 | 回执不吵人 | 后台完成/失败以折叠 notice 注入，不唤醒模型、不额外烧 token |
 | 失败不重试 | `ManualCompactionError` 除 `busy` 外一律终态，避免坏循环反复烧摘要请求 |
-| 仅本会话可见 | 命令注册在 `agent.ctx`，随 agent scope 销毁自动卸载，不会出现在别人的会话里 |
+| 排队按会话隔离 | 命令只注册一次；每个会话各自一份排队状态机，`/compact_queue cancel` 只影响当前会话 |
 
 不提供：跨会话全局队列、持久化队列、UI 面板、HTTP 路由。本包**没有浏览器半边**，只有 Host 半边。
 
@@ -194,7 +194,7 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 
 | 槽位 / 服务 | 占用 | 说明 |
 | --- | --- | --- |
-| `commands`（agent 作用域） | 命令名 `compact_queue` | 每 agent 一份，随 scope 卸载；**不在根 `ctx` 注册** |
+| `commands`（宿主层全局） | 命令名 `compact_queue` | 只注册一次；handler 用 `invocation.agent` 找该会话的排队状态机 |
 | `agent/status` 事件 | 监听 `idle` 翻转 | 双通道之一，挂在 `agent.ctx` |
 | 定时器 | 2 秒 `unref()` tick | 双通道之二，兼做 30 分钟超时判定 |
 | HTTP 路由 / UI 槽位 / 其它服务 | 不占 | 本包没有浏览器半边 |
