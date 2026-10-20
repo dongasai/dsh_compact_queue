@@ -1,94 +1,250 @@
 # @dongasai/dsh-compact-queue
 
-给每个会话一条 **能排队** 的压缩命令：`/compact_queue`。
+给每个 DSH 会话一条**能排队**的压缩命令：`/compact_queue`。
 
-核心 `/compact` 只认「严格 idle 的 agent」——`compactNow` 底下的 `runMaintenance` 在非 idle 时
-直接 throw，外层包成 `ManualCompactionError('busy')`，命令层把它原样转成一句报错回执就完事。
+核心 `/compact` 只认「严格 idle 的 agent」—— `compactNow` 底下的 `runMaintenance` 在非 idle 时
+直接 throw，外层包成 `ManualCompactionError('busy')`，命令层把它原样转成一句报错就完事。
 会话正忙（上一轮还没收尾、maintenance 还没跑完）时想压一下历史，只能等、只能反复敲。
 
-本插件**不改核心**，另注册一条 agent 作用域命令：
+本插件**不改核心**，另注册一条 **agent 作用域**命令：空闲时立刻压缩；忙时把请求排进**本会话**
+队列，等这个会话下一次 idle 自动补跑；排队中随时能撤销。
 
-- 空闲时 → 立刻压缩，回执规格与核心 `/compact` 一致；
-- 忙时 → 把请求排进**本会话**队列，等这个会话下一次 idle 自动补跑；
-- `/compact_queue cancel` → 排队中撤销、执行中 abort。
+| 想知道 | 看 |
+| --- | --- |
+| 怎么用（装 / 用法 / 排错 / 验证 / 边界） | **本文件** |
+| 为什么这么实现（三条官方接缝、双通道触发、失败口径的来龙去脉） | [index.js](index.js) 文件头注释「一 ~ 四」 |
+| 给 agent 的约束与改动连带项 | [AGENTS.md](AGENTS.md) |
+
+## 功能
+
+| 能力 | 说明 |
+| --- | --- |
+| `/compact_queue` | 空闲 → 立即压缩；忙 → 排队并回执「已排队，最长等 30 分钟」 |
+| `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort 其 signal |
+| 自动补跑 | 本会话下一次 idle 触发；`agent/status` 翻转与 2 秒兜底 tick 双通道，不漏触发、不重叠执行 |
+| 回执不吵人 | 后台完成/失败以折叠 notice 注入，不唤醒模型、不额外烧 token |
+| 失败不重试 | `ManualCompactionError` 除 `busy` 外一律终态，避免坏循环反复烧摘要请求 |
+| 仅本会话可见 | 命令注册在 `agent.ctx`，随 agent scope 销毁自动卸载，不会出现在别人的会话里 |
+
+不提供：跨会话全局队列、持久化队列、UI 面板、HTTP 路由。本包**没有浏览器半边**，只有 Host 半边。
+
+## 快速开始
+
+### 前提
+
+- 已有可用的 dsh profile（`web` / `tui` / `headless` 各自独立，装的哪个就只在哪个里生效）
+- 本包 `private: true`，**没有发布到 npm**：只能用 git 源或本地 `link:`，`dsh plugin add @dongasai/dsh-compact-queue` 一定失败
+
+### 装法 A：git 源（发布版）
+
+```bash
+dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1
+```
+
+然后把包名追加进该 profile 的 `dsh.profile.bundles`（`dsh plugin` 只改 pnpm 的 dependencies，
+**不碰** bundles 清单）：
+
+```jsonc
+// ~/.dsh/profiles/web/package.json
+{
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "…原有各项…",
+        "@dongasai/dsh-compact-queue"   // ← 追加到最后一项
+      ]
+    }
+  }
+}
+```
+
+最后**重启 `dsh web`**。
+
+### 装法 B：本地 link（开发自用）
+
+```bash
+dsh plugin --profile web add link:<仓库绝对路径>
+```
+
+同样要追加 `bundles` 一行，同样要重启。`link:` 装的好处是改完源码直接生效（仍需重启），
+省掉每次发版的来回。
+
+### 四条坑
+
+1. **`--profile` 必填**，且必须与你要用的 app 一致。装进 `headless` 却在 `web` 里找命令，界面上一个字都看不到。
+2. **只加依赖、不加 `bundles` = 装了不挂载**。这是「装完没反应」的头号原因：依赖躺在 `dependencies` 里，宿主启动时按 `bundles` 清单装载，清单里没有就永远不加载。
+3. **git 规格必须带 `github:` 或 `git+` 前缀**。照抄仓库页面的 `git@github.com:dongasai/…`（scp 写法）会被 pnpm 当成本地路径，装出一条死的 `link:` 依赖。
+4. **钉版本 `#0.1` 必须真实存在**。本仓库当前 tag 是 `0.1`（附注标签，指向 `79bc3f9`），可用 `git ls-remote --tags origin` 核对；写不存在的 tag 会在 pnpm 解析阶段直接报错。
+
+装完 `~/.dsh/profiles/web/package.json` 的 `dependencies` 里应出现
+`"@dongasai/dsh-compact-queue": "link:…"` 或 `"github:…"`，并且 `dsh.profile.bundles` 里有包名——
+两条都满足才算装对。
+
+### 卸
+
+```bash
+dsh plugin --profile web remove @dongasai/dsh-compact-queue
+```
+
+再把包名从 `dsh.profile.bundles` 里删掉，然后重启。只 remove 依赖、留着 bundles 条目，
+下次启动会因为找不到包而告警。
 
 ## 用法
 
 | 输入 | 行为 |
-|---|---|
+| --- | --- |
 | `/compact_queue` | 立即尝试；会话忙则排队（回执写明「已排队，最长等 30 分钟」与撤销方式） |
-| `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort 其 signal；都没有 → 报错「当前没有排队的压缩」 |
-| `/compact_queue <其它>` | 回用法提示，不执行 |
+| `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort；都没有 → 报「当前没有排队的压缩」 |
+| `/compact_queue <其它>` | 回用法提示，不执行任何压缩 |
 
-压缩完成的即时回执会带 `sourceEventSeq` 指向摘要事件（与核心 `/compact` 同规格）。
+一次典型交互（忙时）：
 
-## 排队状态机
+```
+你  ▸ /compact_queue
+dsh ▸ 会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 30 分钟）。/compact_queue cancel 可撤销。
 
-每个 agent 一份独立状态（`none` / `queued` / `running`），队列只存在于内存：
+    …本轮结束、会话回到 idle…
 
-| 机制 | 说明 |
-|---|---|
-| 乐观排队 | handler 先把 state 置 `queued`、再立刻试一次 → 忙的话队列已经就位，省掉二次竞态判定 |
-| 双通道触发 | `agent/status` 的 idle 翻转 + 每 2s 的兜底 tick。因为 maintenance 全程仍是 idle、不发事件，只等事件会漏触发 |
-| 不重叠 | `running` 布尔锁 + 状态机，两条通道都汇进同一个 `attempt()` |
-| 最长等待 | 30 分钟；超时清队列并回执 |
-| 收摊 | 监听器/定时器/teardown 全挂在 `agent.ctx` 上，随 agent scope 销毁自动卸载；agent 离场时 abort 执行中的压缩 |
-
-`unref()` 的 tick 不拖住进程退出；队列**不持久化**，dsh 重启即丢（这是有意的取舍：压缩请求本身就是一次性的）。
-
-## 回执口径
-
-后台完成/失败用 notice 注入，不唤醒模型、不额外烧 token：
-
-```js
-agent.inject(createUserMessage({
-  content: [{ type: 'text', text }],
-  source: { kind: 'compact-queue', form: 'notice', summary },
-}))
+dsh ▸ 排队压缩完成：压缩了 42 条历史（约 18304 tokens）。     ← 折叠 notice
 ```
 
-形制与 `dsh-tool-jobs` 的完成通知一致（UI 折叠成一行 summary）。**不会**把系统回执标成 `kind: 'user'`。
+空闲时打这条命令不排队，直接回 `压缩完成：42 条历史（约 18304 tokens）。`，并带
+`sourceEventSeq` 指向摘要事件（与核心 `/compact` 同规格）。没有可压缩范围时回
+`当前没有可压缩的历史。`
 
-## 失败映射
+### 回执原文对照
 
-`ManualCompactionError.code` 逐项处理：只有 `busy` 继续排队等，其余都是终态、不再重试（避免坏循环烧摘要请求）。
+排错时按文案直接查表：
 
-| code | 回执 |
-|---|---|
-| `busy` | 不中断，继续等下一次 idle |
-| `cancelled` | 压缩已取消 |
-| `changed` | 选定历史在替换前发生变化，本次未执行 |
-| `summary` | 未能生成有效摘要 |
-| `commit` | 压缩未正常结束，部分历史可能已变动 |
-| `persistence` | 压缩已完成，但会话未能保存 |
+| 场景 | 原文 |
+| --- | --- |
+| 忙、已排队 | `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 30 分钟）。/compact_queue cancel 可撤销。` |
+| 重复入队 | `压缩已在队列中（已排队约 N 分钟）。/compact_queue cancel 可撤销。` |
+| 正在压缩 | `压缩正在执行中。` |
+| 撤销排队 | `已撤销排队的压缩。` |
+| 取消执行中 | `正在取消执行中的压缩。` |
+| 撤销空操作 | `当前没有排队的压缩。` |
+| 参数不对 | `Usage: /compact_queue（排队或立即压缩）或 /compact_queue cancel（撤销）` |
+| 预设缺服务 | `本会话挂载的 agent preset 没有提供 compaction 服务，无法压缩。` |
+| 排队补跑成功 | `排队压缩完成：压缩了 N 条历史（约 M tokens）。` |
+| 排队补跑无历史 | `排队压缩完成前检查：当前没有可压缩的历史。` |
+| 排队补跑失败 | `排队压缩失败：<原因>` |
+| 排队超时 | `/compact_queue 排队超时（等待超过 30 分钟，会话一直未空闲），本次压缩已取消。` |
 
-`compactNow` 返回 `null`（没有可压缩范围）按「没有可压缩历史」的终态成功处理，不重试。
+压缩本身的失败按 `ManualCompactionError.code` 逐条映射，原文如下（源码 `FAILURE_TEXT`）：
 
-## 装 / 卸
+| code | 回执原文 |
+| --- | --- |
+| `cancelled` | `压缩已取消。` |
+| `changed` | `选定的历史在替换前发生了变化，本次未执行。详情见会话日志。` |
+| `summary` | `未能生成有效摘要。详情见会话日志。` |
+| `commit` | `压缩未正常结束，部分历史可能已变动；请先检查会话状态再重试。` |
+| `persistence` | `压缩已完成，但会话未能保存。` |
+
+其余 code 回 `压缩失败（<code>）。`；非 `ManualCompactionError` 回 `压缩失败：<message>`。
+`busy` 不会出现在回执里——它只表示「还没轮到」，继续排队等下一次 idle。
+
+上面都是**命令回执**（完整一句话）。排队补跑的 notice 在 UI 里折叠成一行，文案是
+`排队压缩完成：N 条 ~M tokens` / `排队压缩：没有可压缩的历史` / `排队压缩失败` /
+`compact_queue 排队超时，已取消`，展开可见完整正文。
+
+## 确认它真的在工作
+
+装完重启后，按顺序核三处：
+
+1. **组合配置里有这一层**：`dsh --profile web --dump-config | grep dsh-compact-queue`
+   应能 grep 到 `id: dsh-compact-queue`（来自 [cordis.patch.yml](cordis.patch.yml) 的那一行 `insert`）。
+2. **命令存在**：在会话里敲 `/compact_queue`，出现上面任意一句回执即为注册成功。报「未知命令」= 没重启，或包名不在 `dsh.profile.bundles` 里。
+3. **行为对**：idle 时敲应立即出现 `压缩完成：…`；忙时敲应回「已排队」，并在本轮结束后收到折叠的
+   `排队压缩完成：…`。
+
+## 结构
+
+| 文件 | 作用 |
+| --- | --- |
+| [index.js](index.js) | 唯一源码：`apply(ctx)` 遍历/监听 agent，`attach(ctx, agent)` 为每个 agent 挂状态机与命令 |
+| [cordis.patch.yml](cordis.patch.yml) | bundle 补丁，`- insert:` 一行把插件挂到**宿主层** |
+| [package.json](package.json) | `exports` / `files` / `dsh.bundle.patch`；`private: true` |
+| [AGENTS.md](AGENTS.md) | 给 agent 的架构地图与硬约束 |
+
+Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层的 agent 注册表、预设注册表
+和命令服务；压缩服务是运行时跨 realm 取的（`ctx.agentPresets.serviceFor(agent, 'compaction')`），
+不在 inject 里。
+
+扩展点占用：
+
+| 槽位 / 服务 | 占用 | 说明 |
+| --- | --- | --- |
+| `commands`（agent 作用域） | 命令名 `compact_queue` | 每 agent 一份，随 scope 卸载；**不在根 `ctx` 注册** |
+| `agent/status` 事件 | 监听 `idle` 翻转 | 双通道之一，挂在 `agent.ctx` |
+| 定时器 | 2 秒 `unref()` tick | 双通道之二，兼做 30 分钟超时判定 |
+| HTTP 路由 / UI 槽位 / 其它服务 | 不占 | 本包没有浏览器半边 |
+
+## 与 Agent 的关系
+
+- 命令由**人**敲；agent 那边看到的是压缩之后的历史，不需要（也无法）自己触发排队。
+- 排队完成的 notice 是**系统回执**（`source.kind: 'compact-queue'`、`form: 'notice'`），不唤醒模型、不计为你发的消息。
+- 核心 `/compact` 行为一字未改；本插件失败也不影响那条命令。
+
+## 生效条件
+
+只有 Host 半边，**没有** HMR 可依赖：改 `index.js`、改 `cordis.patch.yml`、升级版本之后，
+一律 **重启 `dsh web`**（命令注册发生在 agent 创建时，重启前已存在的会话不会补注册）。
+刷新浏览器页面不会有任何变化。
+
+## 排错
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 命令补全里没有 `/compact_queue` | 没重启；或包名不在 `dsh.profile.bundles`；或装到了别的 profile | 按「确认它真的在工作」三处依次核 |
+| 一直回「已排队」不下去 | 会话确实一直被占用（长任务、subagent、其它 maintenance 占着） | 等本轮结束；或 `/compact_queue cancel` 撤销 |
+| 回「本会话挂载的 agent preset 没有提供 compaction 服务」 | 当前 preset 没挂 compaction 实现 | 换回带压缩的 preset；这不是排队逻辑的问题 |
+| 排队到 30 分钟突然消失、没有任何提示 | tick 通道命中超时的已知静默缺陷 | 见「已知边界」第 3 条 |
+| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.1` |
+| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.1`） |
+
+## 怎么验证
+
+命令行能覆盖的：
 
 ```bash
-# 装
-plugin_manager(action="install_bundle", target="/data/ai/dsh/dsh_compact_queue")
-
-# 卸
-plugin_manager(action="remove_bundle", target="@dongasai/dsh-compact-queue")
+node --check index.js                                   # 语法
+npm pack --dry-run                                      # 应恰好 4 个文件（index.js / cordis.patch.yml / package.json / README.md）
+git ls-remote --tags origin                             # tag 与远端一致（当前 0.1）
+dsh --profile web --dump-config | grep dsh-compact-queue   # 组合配置里有这一层
 ```
 
-装完 `profiles/web/package.json` 里会多一条
-`"@dongasai/dsh-compact-queue": "link:/data/ai/dsh/dsh_compact_queue"`，并把包名加进 `dsh.profile.bundles`。
+只能在会话里打勾的（没有自动化测试，逐条手验）：
 
-**宿主层插件，改完必须重启 `dsh web`**（命令注册在 agent 创建时发生，热改不会补注册已有会话）。
+1. idle 时 `/compact_queue` → 立即 `压缩完成：N 条历史（约 M tokens）。`
+2. 忙时 `/compact_queue` → 回「已排队」；本轮结束后收到 `排队压缩完成：…` notice
+3. 排队中 `/compact_queue cancel` → `已撤销排队的压缩。`，之后不再触发
+4. 排队中再敲 `/compact_queue` → `压缩已在队列中（已排队约 N 分钟）。`，不产生第二份压缩
+5. 关掉该会话 → 后台无残留定时器、无 unhandled rejection（看宿主日志）
 
-## 依赖与边界
+## 已知边界
 
-- `inject: ['commands', 'agents', 'agentPresets']`：需要宿主层的 agent 注册表与预设注册表
-- 压缩服务跨 realm 取：`ctx.agentPresets.serviceFor(agent, 'compaction')`。取不到就如实报「本会话挂载的 preset 没有提供 compaction 服务」，不猜
-- 命令注册只经 `agent.ctx.commands.register()`（绝不在根 ctx 注册，否则全局可见）
-- 源码是原始 ESM、依赖 `@deepseek-ai/*` 裸导入：**不要在插件目录装 node_modules** ——
-  DSH 的 profile resolver 会把 linked 插件的裸包名路由到安装内副本；独立 `node index.js` 跑不起来是预期
+1. **队列不持久化**。只存在内存，`dsh` 重启即丢。代价：重启前排队的那次压缩不会补跑。原因：压缩请求本身就是一次性的，落盘反而要处理「重启后该不该替你做」。
+2. **最长等 30 分钟**。超过就清队列。代价：真忙超过半小时的会话会丢这次请求。
+3. **tick 通道命中的超时是静默的**（未修）。`attempt(false)` 不发 notice，所以「一直忙到超时、期间没有 idle 翻转」时队列被清掉却没有任何提示；只有 idle 事件那条通道会回执。修法在 [AGENTS.md](AGENTS.md) 的连带项里记着。
+4. **只对已有/新建 agent 生效**。晚创建的 agent 由 `agent/created` 补挂；但**重启前**已存在的会话不会补注册命令——必须重启。
+5. **每个会话独立**。没有全局队列，也不会把 A 会话的压缩请求带进 B 会话。
+6. **`attempt()` 开头重复调用 `isLive()`**，属无害死代码（AGENTS.md 的已知问题清单里也记着）。
+7. **无自动化测试**。状态机与定时器只能手验，验证清单见上一节。
 
-## 已知问题
+## 发版
 
-- 排队超时可能静默取消：tick 通道调 `attempt(false)`，而超时分支只在 `fromQueue !== false` 时回执。
-  会话一直忙到 30 分钟、期间没有 idle 事件时，只有 tick 会命中超时 → 队列清掉但用户收不到回执
-- `attempt()` 开头已判过一次 `isLive()`，紧接着又重复一次，属死代码
+- 当前版本：`package.json` 的 `0.1.0` ↔ 附注 tag `0.1`（**不带 `v`**，与本机其它插件仓的 `0.1` / `0.2` 命名一致）
+- 远端：`origin` = `git@github.com:dongasai/dsh_compact_queue.git`
+- 流程：改 `package.json.version` → `git tag -a 0.1 -m …` → **`git push origin main` 与 `git push origin 0.1` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
+
+## 相关文件
+
+| 文件 | 内容 |
+| --- | --- |
+| [index.js](index.js) | 命令注册、排队状态机、notice 回执、失败映射（含「为什么」文件头注释） |
+| [cordis.patch.yml](cordis.patch.yml) | 宿主层 `insert` 一行 |
+| [package.json](package.json) | 包元数据与 `dsh.bundle.patch` |
+| [AGENTS.md](AGENTS.md) | agent 侧的架构地图、硬约束、改动连带项 |
+| [.agents/index.json](.agents/index.json) | 架构扫描索引（模块快照、覆盖率、缺口） |

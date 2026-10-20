@@ -2,8 +2,8 @@
 
 # AGENTS.md
 
-给在这个仓库里干活的 agent 看的：架构地图、硬约束、改动连带项。面向用户的用法、状态机表、
-失败映射与已知边界在 [README.md](README.md)，本文件不重复那些内容。与代码冲突时以代码为准。
+给在这个仓库里干活的 agent 看的：架构地图、硬约束、改动连带项。面向用户的用法、装法坑、回执原文
+对照、排错与已知边界在 [README.md](README.md)，本文件不重复那些内容。与代码冲突时以代码为准。
 
 **单模块仓**：源码只有一个文件 [index.js](index.js)，没有子目录模块，因此没有下级 `AGENTS.md`；
 下文「模块索引」只是把文件级职责摊开，不构成可独立拆分的模块。
@@ -89,7 +89,7 @@ graph TD
 | 宿主插件 | [index.js](index.js) | 遍历/监听 agent，为每个 agent 注册 scoped 命令 `/compact_queue` 并维护排队状态机，压缩完成/失败以 notice 回执 | `apply(ctx)` → `attach(ctx, agent)` | 宿主层加载；attach 出的监听器/定时器随 agent scope 卸载 |
 | bundle 补丁 | [cordis.patch.yml](cordis.patch.yml) | `- insert:` 一行 `id: dsh-compact-queue`，把插件挂到宿主层 | — | profile 装载时读取 |
 | 包元数据 | [package.json](package.json) | `name` / `exports` / `files` / `dsh.bundle.patch`；`private: true`，不进 npm 公共源 | — | — |
-| 用户文档 | [README.md](README.md) | 装/卸、命令语义、排队状态机、回执口径、失败映射、已知问题 | — | — |
+| 用户文档 | [README.md](README.md) | 装（三种通路 + 四条坑）、命令与回执原文对照表、结构/扩展点占用、排错、两层验证、已知边界 | — | — |
 
 `locale/` 是空目录（git 不跟踪），当前没有 i18n 资源。
 
@@ -97,8 +97,8 @@ graph TD
 
 | 目的 | 做法 |
 |---|---|
-| 装进 profile | `plugin_manager(action="install_bundle", target="/data/ai/dsh/dsh_compact_queue")`；当前 `~/.dsh/profiles/web/package.json` 已是 `"@dongasai/dsh-compact-queue": "link:/data/ai/dsh/dsh_compact_queue"`，并列在 `dsh.profile.bundles` 里 |
-| 卸载 | `plugin_manager(action="remove_bundle", target="@dongasai/dsh-compact-queue")` |
+| 装进 profile | `dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1`（或开发用 `link:<仓库绝对路径>`），**再把包名追加进该 profile 的 `dsh.profile.bundles`** —— `dsh plugin` 只转发给 pnpm 改 dependencies，不会登记 bundles；当前 `~/.dsh/profiles/web/package.json` 已是 `"@dongasai/dsh-compact-queue": "link:/data/ai/dsh/dsh_compact_queue"` 且列在 bundles 里 |
+| 卸载 | `dsh plugin --profile web remove @dongasai/dsh-compact-queue`，并从 `dsh.profile.bundles` 删掉该包名，然后重启 |
 | 让改动生效 | **重启 `dsh web`**。宿主层插件，命令注册发生在 agent 创建时，热改不会给已有会话补注册；没有浏览器半边，不需要 `pnpm run dev:web` 之类的重建 |
 | 手工冒烟 | 在 dsh web 会话里敲 `/compact_queue` 看回执；忙时再敲一次应回「已排队」并在下一次 idle 自动补跑（摘要以折叠 notice 出现） |
 | 依赖安装 | **不要 `npm install`**，也**不要在本目录建 `node_modules`**：源码是原始 ESM、裸导入 `@deepseek-ai/*`，由 DSH profile resolver 路由到安装内副本。直接 `node index.js` 跑不起来是预期行为 |
@@ -130,12 +130,13 @@ timer 逻辑时至少覆盖这五条：
 - **注册位置是硬约束**：命令只经 `agent.ctx.commands.register()` 注册，永远不要在根 `ctx` 上注册；监听器/定时器/teardown 一律走 `agent.ctx.effect(...)`，否则 agent 销毁后泄漏。
 - **改队列逻辑前先读 `attempt()` 全文**：`state`、`running`、`activeAbort`、`watcher` 四个变量互相牵制，只改一条通道（status 或 tick）会破坏「不重叠」保证。
 - **别顺手"优化"乐观排队**：handler 先置 `queued` 再立刻试一次是刻意设计——省掉二次竞态判定，代价只是忙时多一次无副作用调用。
-- **两条已知问题在 README 末尾有账**：① tick 通道命中 30 分钟超时是静默取消（`attempt(false)` 不发 notice）；② `attempt()` 开头连续两次 `isLive()` 属死代码。修任一条要同步更新 README 的「已知问题」。
+- **两条已知问题在 README 末尾有账**：① tick 通道命中 30 分钟超时是静默取消（`attempt(false)` 不发 notice）；② `attempt()` 开头连续两次 `isLive()` 属死代码。修任一条要同步更新 README 的「已知边界」。
 - **发版口径**：`package.json.version` 与 tag 同步（当前 `0.1.0` ↔ 附注 tag `0.1`，不带 `v`，与 `gitea_task_issues` 一致）；远端 `origin` = `git@github.com:dongasai/dsh_compact_queue.git`，发版＝本地提交 → `git tag -a 0.1 -m …` → `git push origin main` 与 `git push origin 0.1` 两条都推（只推分支会丢 tag）。
 - 提交信息沿用 `类型(范围): 中文描述`（已落地的两条：`功能(压缩排队):`、`文档(接入):`）。
 
 ## 变更记录
 
+- **2026-10-20T10:05+08:00** 按「dsh 插件 README 编写经验」重写 README：补三种装法与四条坑（`--profile` 必填、`bundles` 清单必须手加、`github:` 前缀、tag 必须真实）、回执原文对照表、扩展点占用表、两层验证、已知边界逐条带原因与代价；同时纠正旧 README 的装法——`plugin_manager` 是桌面端内置工具，本环境没有，登记 bundles 也不会由 `dsh plugin` 代劳。
 - **2026-10-20T09:52+08:00** 远端落定：`origin` = `git@github.com:dongasai/dsh_compact_queue.git`（新建空仓，`git ls-remote` 无任何 ref）；附注 tag `0.1` 重挂到本提交后与 `main` 一并推送。
 - **2026-10-19T20:46+08:00** 初始化架构文档：新增本文件与 `.agents/index.json`；扫描覆盖 4/4 个被跟踪文件（100%）。无子模块，故不生成下级 `AGENTS.md`。
 - **2026-10-19T20:29+08:00** `29c6b52 文档(接入): 补 cordis.patch.yml 与 README，使包可按 bundle 装入 profile`
