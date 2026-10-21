@@ -97,7 +97,7 @@ graph TD
 
 | 目的 | 做法 |
 |---|---|
-| 装进 profile | 三条通路：Web 插件页「添加插件」→ 点「立即启用」；`dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.2`；`link:<仓库绝对路径>`。`dsh plugin` 现在走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 把声明了 `dsh.bundle` 的包自动选进 `dsh.profile.bundles`，**不需要手写注册行**；当前 web profile 是 `"@dongasai/dsh-compact-queue": "file:…/profiles/web/.local-pkgs/dongasai-dsh-compact-queue-0.1.0.tgz"`（2026-10-20 14:25 打的 tarball，装成 `node_modules/@dongasai/…` 真实目录），本仓改动**不再**自动生效。**别用 `link:`**：链接包只有真身目录被解析，裸导入 `@deepseek-ai/*` 在 `dsh` 之外的进程里解析不到（`dsh` 自己启动时能路由，但那样装过一次后无法用普通 node 复核）；tarball / git 源装出来的真实目录才能稳定加载 |
+| 装进 profile | 三条通路：Web 插件页「添加插件」→ 点「立即启用」；`dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.2`；`link:<仓库绝对路径>`。`dsh plugin` 现在走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 把声明了 `dsh.bundle` 的包自动选进 `dsh.profile.bundles`，**不需要手写注册行**；当前 web profile 是 `"@dongasai/dsh-compact-queue": "github:dongasai/dsh_compact_queue#0.2"`（2026-10-21 装成 `node_modules/@dongasai/…` 真实目录），本仓改动**不再**自动生效。**别用 `link:`**：链接包只有真身目录被解析，裸导入 `@deepseek-ai/*` 在 `dsh` 之外的进程里解析不到（`dsh` 自己启动时能路由，但那样装过一次后无法用普通 node 复核）；tarball / git 源装出来的真实目录才能稳定加载 |
 | 卸载 | `dsh plugin --profile web remove @dongasai/dsh-compact-queue`；`reconcile()` 会把它从 `dsh.profile.bundles` 一并摘掉，重启后命令消失 |
 | 让改动生效 | **重启 `dsh web`**。命令在 `apply()` 里全局注册一次；模块按已解析 URL 进 ESM 缓存，`plugin_manager` 关→开**不会**重新 import，热改一律不生效。没有浏览器半边，不需要 `pnpm run dev:web` 之类的重建。验证装对了：`dsh --profile web --no-open --port 0` 起一个临时实例，看它能否加载该行，再杀掉，别动正在跑的服务 |
 | 手工冒烟 | 在 dsh web 会话里敲 `/compact_queue` 看回执；忙时再敲一次应回「已排队」并在下一次 idle 自动补跑（摘要以折叠 notice 出现） |
@@ -136,7 +136,7 @@ timer 逻辑时至少覆盖这五条：
 
 ## 变更记录
 
-- **2026-10-21T11:20+08:00** 发版 `0.2`：`package.json.version` → `0.2.0`，附注 tag `0.2` 随 `main` 一并推送。实测依据：宿主命令目录里 `compact_queue` 与 `compact`/`permission`/`plan` 并列；忙时排队后由 idle 通道补跑，回执 `排队压缩完成：压缩了 217 条历史（约 144578 tokens）。`。`.agents/index.json` 同步：命令 `scope` 由 `agent` 改为 `host`、`registeredVia` 改 `ctx.commands.register()`、版本与 tags 更新。
+- **2026-10-21T11:20+08:00** 发版 `0.2`：`package.json.version` → `0.2.0`，附注 tag `0.2` 随 `main` 一并推送。实测依据：宿主命令目录里 `compact_queue` 与 `compact`/`permission`/`plan` 并列；忙时排队后由 idle 通道补跑，回执 `排队压缩完成：压缩了 217 条历史（约 144578 tokens）。`。`.agents/index.json` 同步：命令 `scope` 由 `agent` 改为 `host`、`registeredVia` 改 `ctx.commands.register()`、版本与 tags 更新；当日本机 profile 依赖由本地 tarball 切到 `github:dongasai/dsh_compact_queue#0.2`（装完 `index.js` md5 与本仓一致，`import()` 与 `--dump-config` 均通过）。
 - **2026-10-20T14:35+08:00** 修「命令从未注册」：`agent.ctx.commands.register()` 在宿主层插件里必抛 `cannot get property "commands" without inject`（agent scope 的 backing fiber 无 inject，`commands` 不在其 fiber 祖先链上），改为宿主 `ctx.commands.register()` 全局注册一次 + handler 按 `invocation.agent` 分流状态机；profile 改用本地 tarball 装成真实目录。README 的「仅本会话可见」与扩展点表同步改写。
 - **2026-10-20T11:15+08:00** 安装章节按 gitea README 的写法重写：恢复「Web 界面装法」（插件页 → 添加插件 → 立即启用，第六版误判为不存在）、删掉「必须手写 `dsh.profile.bundles`」的错误步骤（`dsh plugin` 已走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 自动选中 bundle）、补齐「副本 vs `link:`」区别、无构建步骤说明、装完 `--dump-config | grep -A1` 的实测三行输出与 `systemctl --user restart dsh.service` 提示。
 - **2026-10-20T11:05+08:00** 按插件 README 编写规范（`note/readme-spec.md` §2.3）重写 README 安装章节：改成「装 → 登记 bundles → 重启 → 确认」四步编号（每步带命令 + 期望输出），明说没有 registry 装法且插件市场搜不到，补「首次配置：没有」的「情况 → 显示 → 动作」表；`--dump-config` 期望输出改为本机实测三行；删掉重复的独立「确认它真的在工作」「生效条件」两节（并入第 3、4 步）。

@@ -80,7 +80,7 @@
       "quality": { "eslint": false, "prettier": false, "other": [] },
       "keyPaths": ["index.js", "cordis.patch.yml", "package.json", "README.md", "AGENTS.md"],
       "profiles": [
-        { "profile": "web", "declaration": "link:/data/ai/dsh/dsh_compact_queue", "inBundles": true }
+        { "profile": "web", "declaration": "github:dongasai/dsh_compact_queue#0.2", "inBundles": true }
       ]
     }
   ],
