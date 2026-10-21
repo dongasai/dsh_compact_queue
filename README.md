@@ -58,7 +58,7 @@ dsh plugin --profile web add github:dongasai/dsh_compact_queue
 # 或
 dsh plugin --profile web add git+https://github.com/dongasai/dsh_compact_queue.git
 # 钉版本（URL 后加 #<tag>，锁到某个发布版本来复现问题 / 稳定使用）
-dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1
+dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.2
 ```
 
 `dsh plugin --profile <name> <pnpm args>` 把参数交给
@@ -68,8 +68,8 @@ dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.1
 - `--profile` **必填**（不写直接报 `required option '--profile <name> not specified'`）。
 - **必须带 `git+` 或 `github:` 前缀**。`git@github.com:owner/repo.git` 这种 scp 写法不会被认成
   git spec，pnpm 会把它当路径，装出一条指向不存在目录的 `link:` 死链。
-- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.1`），tag / 分支 / commit 都行；
-  本仓库当前 tag 是 `0.1`，对应 `package.json` 的 `0.1.0` —— 不带 `#` 则跟 `main` 走，
+- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.2`），tag / 分支 / commit 都行；
+  本仓库当前 tag 是 `0.2`，对应 `package.json` 的 `0.2.0` —— 不带 `#` 则跟 `main` 走，
   每次装到的都可能是新代码。
 - pnpm 默认会拦 `prepare` 等依赖构建脚本；本包**没有任何构建步骤**（纯 ESM 源码 + 一个 cordis
   补丁，没有编译产物），不会遇到。
@@ -213,8 +213,8 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 | 一直回「已排队」不下去 | 会话确实一直被占用（长任务、subagent、其它 maintenance 占着） | 等本轮结束；或 `/compact_queue cancel` 撤销 |
 | 回「本会话挂载的 agent preset 没有提供 compaction 服务」 | 当前 preset 没挂 compaction 实现 | 换回带压缩的 preset；这不是排队逻辑的问题 |
 | 排队到 30 分钟突然消失、没有任何提示 | tick 通道命中超时的已知静默缺陷 | 见「已知边界」第 3 条 |
-| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.1` |
-| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.1`） |
+| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.2` |
+| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.2`） |
 
 ## 怎么验证
 
@@ -224,7 +224,7 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 node --check index.js                                        # 语法：无输出即通过
 npm pack --dry-run                                           # 应恰好 4 个文件（index.js / cordis.patch.yml / package.json / README.md）
 grep -n 'dsh-compact-queue' ~/.dsh/profiles/web/package.json  # 两行：dependencies + dsh.profile.bundles（安装时自动登记）
-git ls-remote --tags origin                                  # 当前应看到 0.1 及其指向的提交
+git ls-remote --tags origin                                  # 当前应看到 0.1、0.2 及各自指向的提交
 dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # 期望三行，见「装完确认」
 ```
 
@@ -248,9 +248,9 @@ dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # �
 
 ## 发版
 
-- 当前版本：`package.json` 的 `0.1.0` ↔ 附注 tag `0.1`（**不带 `v`**，与本机其它插件仓的 `0.1` / `0.2` 命名一致）
+- 当前版本：`package.json` 的 `0.2.0` ↔ 附注 tag `0.2`（**不带 `v`**，与本机其它插件仓的 `0.1` / `0.2` 命名一致）
 - 远端：`origin` = `git@github.com:dongasai/dsh_compact_queue.git`
-- 流程：改 `package.json.version` → `git tag -a 0.1 -m …` → **`git push origin main` 与 `git push origin 0.1` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
+- 流程：改 `package.json.version` → `git tag -a 0.2 -m …` → **`git push origin main` 与 `git push origin 0.2` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
 
 ## 相关文件
 

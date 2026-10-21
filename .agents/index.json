@@ -5,13 +5,13 @@
   "repo": {
     "root": ".",
     "name": "@dongasai/dsh-compact-queue",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "kind": "dsh-bundle-plugin",
     "vcs": {
       "type": "git",
       "branch": "main",
-      "head": "见 git log -1（0.1 附注 tag 指向该发行提交）",
-      "tags": ["0.1"],
+      "head": "见 git log -1（0.2 附注 tag 指向该发行提交）",
+      "tags": ["0.1", "0.2"],
       "remotes": [
         { "name": "origin", "url": "git@github.com:dongasai/dsh_compact_queue.git" }
       ]
@@ -69,7 +69,7 @@
       "entrySymbols": ["apply", "attach", "performCompact", "attempt", "notify"],
       "exports": ["name", "inject", "apply"],
       "interfaces": [
-        { "kind": "command", "name": "compact_queue", "scope": "agent", "registeredVia": "agent.ctx.commands.register()", "args": ["", "cancel"] },
+        { "kind": "command", "name": "compact_queue", "scope": "host", "registeredVia": "ctx.commands.register()（宿主层注册一次，handler 按 invocation.agent 分流）", "args": ["", "cancel"] },
         { "kind": "cordis-patch", "path": "cordis.patch.yml", "insert": ["dsh-compact-queue"] }
       ],
       "injects": ["commands", "agents", "agentPresets"],
@@ -98,6 +98,6 @@
   "nextSteps": [
     "为状态机补最小冒烟脚本或探针（排队/撤销/超时/agent 离场四条路径）",
     "修 tick 超时静默取消：超时分支应不分通道都发 notice",
-    "核对远端：main 与 tag 0.1 都要在 origin 上（git ls-remote --tags）"
+    "核对远端：main 与 tag 0.2 都要在 origin 上（git ls-remote --tags）"
   ]
 }

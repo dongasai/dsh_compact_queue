@@ -1,6 +1,6 @@
 {
   "name": "@dongasai/dsh-compact-queue",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Host-registered /compact_queue command with per-agent queues: runs compaction now when the session is idle, otherwise queues it and fires on the next idle window (core /compact only reports busy).",
