@@ -13,7 +13,7 @@
 给每个 DSH 会话一条**能排队**的压缩命令 `/compact_queue`：
 
 - 会话空闲 → 立刻压缩，回执规格与核心 `/compact` 一致（成功时带 `sourceEventSeq` 指向摘要事件）；
-- 会话正忙 → 把请求排进**本会话**内存队列，等这个会话下一次 idle 自动补跑（最长等 30 分钟）；
+- 会话正忙 → 把请求排进**本会话**内存队列，等这个会话下一次 idle 自动补跑（默认最长等 24 小时；`/compact_queue ~` 不设超时、无限等待）；
 - `/compact_queue cancel` → 排队中撤销、执行中 `abort()`。
 
 三条设计红线：
@@ -56,21 +56,21 @@ apply(ctx)                            ← 宿主 ctx，拿得到 agents / agentP
 
 **双通道触发**（缺一不可）：`agent/status` 只在 `idle ⇄ running` 字符串翻转时发射，而
 `compactNow` 内部的 maintenance（idle→maintenance→idle）全程都是 idle、**不发事件**，所以除了
-status 监听还要挂一个 2s 的 `unref()` tick 兜底；tick 同时承担 30 分钟超时判定。两条通道都汇进
-同一个 `attempt()`，靠 `running` 布尔 + state 机保证不重叠。
+status 监听还要挂一个 2s 的 `unref()` tick 兜底；tick 同时承担默认 24 小时超时判定（`~` 排队置
+`unlimited` 后跳过）。两条通道都汇进同一个 `attempt()`，靠 `running` 布尔 + state 机保证不重叠。
 
 ## 模块结构图
 
 ```mermaid
 graph TD
-    A["(根) dsh_compact_queue<br/>@dongasai/dsh-compact-queue 0.2.0"] --> B["index.js<br/>宿主插件（唯一源码）"]
+    A["(根) dsh_compact_queue<br/>@dongasai/dsh-compact-queue 0.3.0"] --> B["index.js<br/>宿主插件（唯一源码）"]
     A --> C["cordis.patch.yml<br/>bundle 补丁：宿主层一行 insert"]
     A --> D["package.json<br/>exports / files / dsh.bundle"]
     A --> E["README.md<br/>用法·状态机·失败映射"]
     A --> F["AGENTS.md<br/>本文件（架构与约束）"]
     B --> B1["apply(ctx)<br/>遍历已有 agent + 监听新建"]
     B --> B2["attach(ctx, agent)<br/>每个 agent 一份状态机"]
-    B2 --> B3["命令 handler<br/>/compact_queue [cancel]"]
+    B2 --> B3["命令 handler<br/>/compact_queue [~|cancel]"]
     B2 --> B4["attempt()<br/>status 事件 + 2s tick 双通道"]
     B2 --> B5["notify()<br/>notice 注入回执"]
     B4 --> B6["performCompact()<br/>serviceFor(agent,'compaction')"]
@@ -88,7 +88,7 @@ graph TD
 |---|---|---|---|---|
 | 宿主插件 | [index.js](index.js) | 在宿主层注册全局命令 `/compact_queue`（一次），为每个 agent 维护独立的排队状态机，压缩完成/失败以 notice 回执 | `apply(ctx)` → `attach(ctx, agent)` | 宿主层加载；attach 出的监听器/定时器随 agent scope 卸载 |
 | bundle 补丁 | [cordis.patch.yml](cordis.patch.yml) | `- insert:` 一行 `id: dsh-compact-queue`，把插件挂到宿主层 | — | profile 装载时读取 |
-| 包元数据 | [package.json](package.json) | `name` / `exports` / `files` / `dsh.bundle.patch`；`private: true`，不进 npm 公共源 | — | — |
+| 包元数据 | [package.json](package.json) | `name` / `exports` / `files` / `dsh.bundle.patch`；已设 `publishConfig.public`（尚未发 npm） | — | — |
 | 用户文档 | [README.md](README.md) | 安装（Web / git 源 / `link:` 三种装法 + 装完确认 + 卸）、命令与回执原文对照表、结构/扩展点占用、排错、两层验证、已知边界 | — | — |
 
 `locale/` 是空目录（git 不跟踪），当前没有 i18n 资源。
@@ -109,7 +109,7 @@ graph TD
 timer 逻辑时至少覆盖这五条：
 
 1. **空闲直压**：idle 时 `/compact_queue` → 立即完成回执，带 `sourceEventSeq`。
-2. **忙时排队**：running 时 `/compact_queue` → 回「已排队，最长 30 分钟」；本轮结束后自动补跑，摘要以 notice 出现。
+2. **忙时排队**：running 时 `/compact_queue` → 回「已排队，最长 24 小时」；running 时 `/compact_queue ~` → 回「无限等待，不设超时」，且超时不会清队列；本轮结束后自动补跑，摘要以 notice 出现。
 3. **撤销**：排队中 `cancel` → 「已撤销」且不再触发；执行中 `cancel` → abort 生效，回执「压缩已取消」。
 4. **重复入队**：排队中再次 `/compact_queue` → 报「已在队列中（约 N 分钟）」，不产生第二份压缩。
 5. **agent 离场**：会话销毁时定时器清掉、执行中的压缩被 abort、日志无 unhandled rejection。
@@ -123,19 +123,21 @@ timer 逻辑时至少覆盖这五条：
 - 注释写**为什么**（哪个官方接缝、哪条源码注释支撑），不写「这里做了什么」的复述；文件头用编号小节承载设计决策。
 - 用户可见文案一律中文，且与核心 `/compact` 的失败口径对齐（`FAILURE_TEXT` 逐条映射 `ManualCompactionError.code`）。
 - 新增/修改回执必须保持 `form: 'notice'`；任何时候都不得把系统回执标成 `kind: 'user'`。
-- 常量集中在文件头（`QUEUE_TICK_MS`、`MAX_WAIT_MS`），文案常量（`USAGE`、`FAILURE_TEXT`）放在函数之前。
+- 常量集中在文件头（`QUEUE_TICK_MS`、`MAX_WAIT_MS`、`MAX_WAIT_TEXT`），文案常量（`USAGE`、`FAILURE_TEXT`）放在函数之前；`~` 的无限等待由 `unlimited` 布尔控制，跳过 `MAX_WAIT_MS` 判定。
 
 ## AI 使用指引
 
 - **注册位置是硬约束**：命令只在宿主 `ctx.commands.register()` 上注册一次，agent 维度靠 `invocation.agent` 分流——`agent.ctx.commands` 在宿主层插件里必然抛错（见上表）。但监听器/定时器/teardown 仍走 `agent.ctx.on/effect`：那是 Context 自身成员，不触发服务解析，且随 agent scope 卸载。
 - **改队列逻辑前先读 `attempt()` 全文**：`state`、`running`、`activeAbort`、`watcher` 四个变量互相牵制，只改一条通道（status 或 tick）会破坏「不重叠」保证。
 - **别顺手"优化"乐观排队**：handler 先置 `queued` 再立刻试一次是刻意设计——省掉二次竞态判定，代价只是忙时多一次无副作用调用。
-- **两条已知问题在 README 末尾有账**：① tick 通道命中 30 分钟超时是静默取消（`attempt(false)` 不发 notice）；② `attempt()` 开头连续两次 `isLive()` 属死代码。修任一条要同步更新 README 的「已知边界」。
-- **发版口径**：`package.json.version` 与 tag 同步（当前 `0.2.0` ↔ 附注 tag `0.2`，不带 `v`，与 `gitea_task_issues` 一致）；远端 `origin` = `git@github.com:dongasai/dsh_compact_queue.git`，发版＝本地提交 → `git tag -a 0.2 -m …` → `git push origin main` 与 `git push origin 0.2` 两条都推（只推分支会丢 tag）。
+- **两条已知问题在 README 末尾有账**：① tick 通道命中 24 小时超时是静默取消（`attempt(false)` 不发 notice，`~` 排队不设超时可绕过）；② `attempt()` 开头连续两次 `isLive()` 属死代码。修任一条要同步更新 README 的「已知边界」。
+- **发版口径**：`package.json.version` 与 tag 同步（当前 `0.3.0` ↔ 附注 tag `0.3`，不带 `v`，与 `gitea_task_issues` 一致）；远端 `origin` = `git@github.com:dongasai/dsh_compact_queue.git`，发版＝本地提交 → `git tag -a 0.3 -m …` → `git push origin main` 与 `git push origin 0.3` 两条都推（只推分支会丢 tag）。
 - 提交信息沿用 `类型(范围): 中文描述`（已落地的两条：`功能(压缩排队):`、`文档(接入):`）。
 
 ## 变更记录
 
+- **2026-11-21T17:47+08:00** 发版 `0.3`：`package.json.version` → `0.3.0`，附注 tag `0.3` 随 `main` 一并推送到 origin。README / AGENTS / `.agents/index.json` 的版本号、钉版本示例、发版口径、tag 清单同步到 0.3；`package.json` 既有的去 `private` + `publishConfig.public` 改动随本次一并提交（尚未发 npm），文档里对应的 `private: true` 描述已改为实际状态。本机 web profile 仍指向 `#0.2`，未随发版切换。
+- **2026-11-21T17:36+08:00** 排队默认时长 30 分钟 → 24 小时，并新增 `/compact_queue ~`（无限等待）：`MAX_WAIT_MS` 改 24h，新增联动文案常量 `MAX_WAIT_TEXT` 避免回执显示「1440 分钟」；`attach()` 增 `unlimited` 布尔，`~` 置位后跳过超时判定、`stopQueue()` 复位；USAGE 与忙时回执区分「最长等待 24 小时」/「无限等待，不设超时」。README（功能/用法/回执对照/排错/验证/已知边界）与本文件（愿景/双通道/模块图/测试/编码规范/已知问题）同步更新。同日发版 `0.3`。
 - **2026-10-21T11:20+08:00** 发版 `0.2`：`package.json.version` → `0.2.0`，附注 tag `0.2` 随 `main` 一并推送。实测依据：宿主命令目录里 `compact_queue` 与 `compact`/`permission`/`plan` 并列；忙时排队后由 idle 通道补跑，回执 `排队压缩完成：压缩了 217 条历史（约 144578 tokens）。`。`.agents/index.json` 同步：命令 `scope` 由 `agent` 改为 `host`、`registeredVia` 改 `ctx.commands.register()`、版本与 tags 更新；当日本机 profile 依赖由本地 tarball 切到 `github:dongasai/dsh_compact_queue#0.2`（装完 `index.js` md5 与本仓一致，`import()` 与 `--dump-config` 均通过）。
 - **2026-10-20T14:35+08:00** 修「命令从未注册」：`agent.ctx.commands.register()` 在宿主层插件里必抛 `cannot get property "commands" without inject`（agent scope 的 backing fiber 无 inject，`commands` 不在其 fiber 祖先链上），改为宿主 `ctx.commands.register()` 全局注册一次 + handler 按 `invocation.agent` 分流状态机；profile 改用本地 tarball 装成真实目录。README 的「仅本会话可见」与扩展点表同步改写。
 - **2026-10-20T11:15+08:00** 安装章节按 gitea README 的写法重写：恢复「Web 界面装法」（插件页 → 添加插件 → 立即启用，第六版误判为不存在）、删掉「必须手写 `dsh.profile.bundles`」的错误步骤（`dsh plugin` 已走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 自动选中 bundle）、补齐「副本 vs `link:`」区别、无构建步骤说明、装完 `--dump-config | grep -A1` 的实测三行输出与 `systemctl --user restart dsh.service` 提示。

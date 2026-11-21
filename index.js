@@ -39,7 +39,8 @@
  * `agent/status` 只在 `idle ⇄ running` **字符串翻转**时发射；`compactNow`
  * 内部的 maintenance（idle→maintenance→idle）全程都是 idle，不发事件。所以
  * 除 status 监听外再挂一个低频 tick（QUEUE_TICK_MS）兜底，并在 tick 里做
- * 最长等待（MAX_WAIT_MS）超时判定。tick 用 `unref()`，不拖进程退出；两条
+ * 最长等待（MAX_WAIT_MS）超时判定；`/compact_queue ~` 排入的请求 unlimited=true，
+ * 跳过超时判定，一直等到本会话空闲（或被 cancel / 会话销毁）。tick 用 `unref()`，不拖进程退出；两条
  * 通道都进同一个 `attempt()`，`running` 布尔 + state 机保证不重叠执行。
  *
  * ## 三、回执不伪装成用户消息
@@ -64,9 +65,11 @@ import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm';
 export const name = 'compact-queue';
 export const inject = ['commands', 'agents', 'agentPresets'];
 
-const USAGE = 'Usage: /compact_queue（排队或立即压缩）或 /compact_queue cancel（撤销）';
+const USAGE = 'Usage: /compact_queue（排队或立即压缩）或 /compact_queue ~（无限等待）或 /compact_queue cancel（撤销）';
 const QUEUE_TICK_MS = 2000;
-const MAX_WAIT_MS = 30 * 60 * 1000;
+const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
+/** 回执展示用的最长等待时长（与 MAX_WAIT_MS 联动，改成小时后不再误显示成分钟数）。 */
+const MAX_WAIT_TEXT = `${MAX_WAIT_MS / (60 * 60 * 1000)} 小时`;
 
 /** ManualCompactionError.code（busy 除外）到人类文案，口径对齐核心 /compact。 */
 const FAILURE_TEXT = {
@@ -86,6 +89,8 @@ function attach(ctx, agent) {
 	let state = 'none';
 	let enqueuedAt = 0;
 	let running = false;
+	/** `/compact_queue ~` 置位：跳过 MAX_WAIT_MS 超时，无限等待本会话空闲。 */
+	let unlimited = false;
 	let watcher;
 	let activeAbort;
 
@@ -100,6 +105,7 @@ function attach(ctx, agent) {
 	const stopQueue = () => {
 		state = 'none';
 		enqueuedAt = 0;
+		unlimited = false;
 		if (watcher !== undefined) {
 			clearInterval(watcher);
 			watcher = undefined;
@@ -164,11 +170,11 @@ function attach(ctx, agent) {
 			stopQueue();
 			return;
 		}
-		if (Date.now() - enqueuedAt > MAX_WAIT_MS) {
+		if (!unlimited && Date.now() - enqueuedAt > MAX_WAIT_MS) {
 			stopQueue();
 			if (fromQueue !== false) {
 				notify(
-					`/compact_queue 排队超时（等待超过 ${Math.round(MAX_WAIT_MS / 60000)} 分钟，会话一直未空闲），本次压缩已取消。`,
+					`/compact_queue 排队超时（等待超过 ${MAX_WAIT_TEXT}，会话一直未空闲），本次压缩已取消。`,
 					'compact_queue 排队超时，已取消',
 				);
 			}
@@ -232,7 +238,8 @@ function attach(ctx, agent) {
 			}
 			return { kind: 'error', text: '当前没有排队的压缩。' };
 		}
-		if (input !== '') return { kind: 'error', text: USAGE };
+		if (input !== '' && input !== '~') return { kind: 'error', text: USAGE };
+		const wantUnlimited = input === '~';
 		if (running || state === 'running') return { kind: 'error', text: '压缩正在执行中。' };
 		if (state === 'queued') {
 			const waitedMin = Math.max(1, Math.round((Date.now() - enqueuedAt) / 60000));
@@ -241,6 +248,7 @@ function attach(ctx, agent) {
 		// 乐观排队后立刻试一次：busy 时队列已经就位，省去二次竞态判定。
 		state = 'queued';
 		enqueuedAt = Date.now();
+		unlimited = wantUnlimited;
 		startWatch();
 		running = true;
 		let outcome;
@@ -250,9 +258,10 @@ function attach(ctx, agent) {
 			running = false;
 		}
 		if (outcome.kind === 'busy') {
+			const waitDesc = wantUnlimited ? '无限等待，不设超时' : `最长等待 ${MAX_WAIT_TEXT}`;
 			return {
 				kind: 'success',
-				text: `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 ${Math.round(MAX_WAIT_MS / 60000)} 分钟）。/compact_queue cancel 可撤销。`,
+				text: `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（${waitDesc}）。/compact_queue cancel 可撤销。`,
 			};
 		}
 		stopQueue();

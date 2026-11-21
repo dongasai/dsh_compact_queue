@@ -19,7 +19,8 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| `/compact_queue` | 空闲 → 立即压缩；忙 → 排队并回执「已排队，最长等 30 分钟」 |
+| `/compact_queue` | 空闲 → 立即压缩；忙 → 排队并回执「已排队，最长等 24 小时」 |
+| `/compact_queue ~` | 同上，但排队**不设超时**（无限等待本会话空闲），适合长任务会话 |
 | `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort 其 signal |
 | 自动补跑 | 本会话下一次 idle 触发；`agent/status` 翻转与 2 秒兜底 tick 双通道，不漏触发、不重叠执行 |
 | 回执不吵人 | 后台完成/失败以折叠 notice 注入，不唤醒模型、不额外烧 token |
@@ -37,7 +38,7 @@
 生效的那一行就来自本包自带的 [cordis.patch.yml](cordis.patch.yml)。命令行（方式二、三）安装会顺带把它
 选进 `dsh.profile.bundles`；Web 上（方式一）是装完点 **立即启用** 才选中 —— 不点就只是「装着但没启用」。
 
-本包 `private: true`、未发布到 npm，所以没有「按包名从 registry 装」这条路：spec 要么是本地路径，
+本包尚未发布到 npm，所以没有「按包名从 registry 装」这条路：spec 要么是本地路径，
 要么是 git 地址。
 
 ### 方式一：Web 界面（推荐）
@@ -58,7 +59,7 @@ dsh plugin --profile web add github:dongasai/dsh_compact_queue
 # 或
 dsh plugin --profile web add git+https://github.com/dongasai/dsh_compact_queue.git
 # 钉版本（URL 后加 #<tag>，锁到某个发布版本来复现问题 / 稳定使用）
-dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.2
+dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.3
 ```
 
 `dsh plugin --profile <name> <pnpm args>` 把参数交给
@@ -68,8 +69,8 @@ dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.2
 - `--profile` **必填**（不写直接报 `required option '--profile <name> not specified'`）。
 - **必须带 `git+` 或 `github:` 前缀**。`git@github.com:owner/repo.git` 这种 scp 写法不会被认成
   git spec，pnpm 会把它当路径，装出一条指向不存在目录的 `link:` 死链。
-- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.2`），tag / 分支 / commit 都行；
-  本仓库当前 tag 是 `0.2`，对应 `package.json` 的 `0.2.0` —— 不带 `#` 则跟 `main` 走，
+- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.3`），tag / 分支 / commit 都行；
+  本仓库当前 tag 是 `0.3`，对应 `package.json` 的 `0.3.0` —— 不带 `#` 则跟 `main` 走，
   每次装到的都可能是新代码。
 - pnpm 默认会拦 `prepare` 等依赖构建脚本；本包**没有任何构建步骤**（纯 ESM 源码 + 一个 cordis
   补丁，没有编译产物），不会遇到。
@@ -122,7 +123,8 @@ dsh plugin --profile web remove @dongasai/dsh-compact-queue
 
 | 输入 | 行为 |
 | --- | --- |
-| `/compact_queue` | 立即尝试；会话忙则排队（回执写明「已排队，最长等 30 分钟」与撤销方式） |
+| `/compact_queue` | 立即尝试；会话忙则排队（回执写明「已排队，最长等 24 小时」与撤销方式） |
+| `/compact_queue ~` | 立即尝试；会话忙则排队且**不设超时**（回执写明「无限等待，不设超时」） |
 | `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort；都没有 → 报「当前没有排队的压缩」 |
 | `/compact_queue <其它>` | 回用法提示，不执行任何压缩 |
 
@@ -130,7 +132,7 @@ dsh plugin --profile web remove @dongasai/dsh-compact-queue
 
 ```
 你  ▸ /compact_queue
-dsh ▸ 会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 30 分钟）。/compact_queue cancel 可撤销。
+dsh ▸ 会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 24 小时）。/compact_queue cancel 可撤销。
 
     …本轮结束、会话回到 idle…
 
@@ -141,24 +143,28 @@ dsh ▸ 排队压缩完成：压缩了 42 条历史（约 18304 tokens）。    
 `sourceEventSeq` 指向摘要事件（与核心 `/compact` 同规格）。没有可压缩范围时回
 `当前没有可压缩的历史。`
 
+忙时想彻底不限等待时长，用 `/compact_queue ~`：回执里的「最长等待 24 小时」换成
+「无限等待，不设超时」，其余行为一致；一直挂到本会话空闲或被 `cancel`。
+
 ### 回执原文对照
 
 排错时按文案直接查表：
 
 | 场景 | 原文 |
 | --- | --- |
-| 忙、已排队 | `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 30 分钟）。/compact_queue cancel 可撤销。` |
+| 忙、已排队（默认） | `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（最长等待 24 小时）。/compact_queue cancel 可撤销。` |
+| 忙、已排队（`~`） | `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（无限等待，不设超时）。/compact_queue cancel 可撤销。` |
 | 重复入队 | `压缩已在队列中（已排队约 N 分钟）。/compact_queue cancel 可撤销。` |
 | 正在压缩 | `压缩正在执行中。` |
 | 撤销排队 | `已撤销排队的压缩。` |
 | 取消执行中 | `正在取消执行中的压缩。` |
 | 撤销空操作 | `当前没有排队的压缩。` |
-| 参数不对 | `Usage: /compact_queue（排队或立即压缩）或 /compact_queue cancel（撤销）` |
+| 参数不对 | `Usage: /compact_queue（排队或立即压缩）或 /compact_queue ~（无限等待）或 /compact_queue cancel（撤销）` |
 | 预设缺服务 | `本会话挂载的 agent preset 没有提供 compaction 服务，无法压缩。` |
 | 排队补跑成功 | `排队压缩完成：压缩了 N 条历史（约 M tokens）。` |
 | 排队补跑无历史 | `排队压缩完成前检查：当前没有可压缩的历史。` |
 | 排队补跑失败 | `排队压缩失败：<原因>` |
-| 排队超时 | `/compact_queue 排队超时（等待超过 30 分钟，会话一直未空闲），本次压缩已取消。` |
+| 排队超时 | `/compact_queue 排队超时（等待超过 24 小时，会话一直未空闲），本次压缩已取消。` |
 
 压缩本身的失败按 `ManualCompactionError.code` 逐条映射，原文如下（源码 `FAILURE_TEXT`）：
 
@@ -183,7 +189,7 @@ dsh ▸ 排队压缩完成：压缩了 42 条历史（约 18304 tokens）。    
 | --- | --- |
 | [index.js](index.js) | 唯一源码：`apply(ctx)` 遍历/监听 agent，`attach(ctx, agent)` 为每个 agent 挂状态机与命令 |
 | [cordis.patch.yml](cordis.patch.yml) | bundle 补丁，`- insert:` 一行把插件挂到**宿主层** |
-| [package.json](package.json) | `exports` / `files` / `dsh.bundle.patch`；`private: true` |
+| [package.json](package.json) | `exports` / `files` / `dsh.bundle.patch`；`publishConfig.public` |
 | [AGENTS.md](AGENTS.md) | 给 agent 的架构地图与硬约束 |
 
 Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层的 agent 注册表、预设注册表
@@ -196,7 +202,7 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 | --- | --- | --- |
 | `commands`（宿主层全局） | 命令名 `compact_queue` | 只注册一次；handler 用 `invocation.agent` 找该会话的排队状态机 |
 | `agent/status` 事件 | 监听 `idle` 翻转 | 双通道之一，挂在 `agent.ctx` |
-| 定时器 | 2 秒 `unref()` tick | 双通道之二，兼做 30 分钟超时判定 |
+| 定时器 | 2 秒 `unref()` tick | 双通道之二，兼做默认 24 小时超时判定；`~` 排队跳过超时 |
 | HTTP 路由 / UI 槽位 / 其它服务 | 不占 | 本包没有浏览器半边 |
 
 ## 与 Agent 的关系
@@ -212,9 +218,9 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 | 命令补全里没有 `/compact_queue` | 没重启；或 Web 上装了没点「立即启用」；或装到了别的 profile | 按「安装 → 装完确认」逐条核：`dsh --profile web --dump-config \| grep -A1 dsh-compact-queue` 有没有那三行 |
 | 一直回「已排队」不下去 | 会话确实一直被占用（长任务、subagent、其它 maintenance 占着） | 等本轮结束；或 `/compact_queue cancel` 撤销 |
 | 回「本会话挂载的 agent preset 没有提供 compaction 服务」 | 当前 preset 没挂 compaction 实现 | 换回带压缩的 preset；这不是排队逻辑的问题 |
-| 排队到 30 分钟突然消失、没有任何提示 | tick 通道命中超时的已知静默缺陷 | 见「已知边界」第 3 条 |
-| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.2` |
-| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.2`） |
+| 排队到 24 小时突然消失、没有任何提示 | tick 通道命中超时的已知静默缺陷 | 用 `/compact_queue ~` 排队可绕过超时；详见「已知边界」第 3 条 |
+| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.3` |
+| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.3`） |
 
 ## 怎么验证
 
@@ -224,7 +230,7 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 node --check index.js                                        # 语法：无输出即通过
 npm pack --dry-run                                           # 应恰好 4 个文件（index.js / cordis.patch.yml / package.json / README.md）
 grep -n 'dsh-compact-queue' ~/.dsh/profiles/web/package.json  # 两行：dependencies + dsh.profile.bundles（安装时自动登记）
-git ls-remote --tags origin                                  # 当前应看到 0.1、0.2 及各自指向的提交
+git ls-remote --tags origin                                  # 当前应看到 0.1、0.2、0.3 及各自指向的提交
 dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # 期望三行，见「装完确认」
 ```
 
@@ -234,13 +240,14 @@ dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # �
 2. 忙时 `/compact_queue` → 回「已排队」；本轮结束后收到 `排队压缩完成：…` notice
 3. 排队中 `/compact_queue cancel` → `已撤销排队的压缩。`，之后不再触发
 4. 排队中再敲 `/compact_queue` → `压缩已在队列中（已排队约 N 分钟）。`，不产生第二份压缩
-5. 关掉该会话 → 后台无残留定时器、无 unhandled rejection（看宿主日志）
+5. 忙时 `/compact_queue ~` → 回执写「无限等待，不设超时」；会话转 idle 后仍会补跑（超时不会清掉它）
+6. 关掉该会话 → 后台无残留定时器、无 unhandled rejection（看宿主日志）
 
 ## 已知边界
 
 1. **队列不持久化**。只存在内存，`dsh` 重启即丢。代价：重启前排队的那次压缩不会补跑。原因：压缩请求本身就是一次性的，落盘反而要处理「重启后该不该替你做」。
-2. **最长等 30 分钟**。超过就清队列。代价：真忙超过半小时的会话会丢这次请求。
-3. **tick 通道命中的超时是静默的**（未修）。`attempt(false)` 不发 notice，所以「一直忙到超时、期间没有 idle 翻转」时队列被清掉却没有任何提示；只有 idle 事件那条通道会回执。修法在 [AGENTS.md](AGENTS.md) 的连带项里记着。
+2. **默认最长等 24 小时**，超过就清队列；`/compact_queue ~` 可跳过超时、无限等待。代价：默认档下真忙超过一天的会话会丢这次请求；`~` 档下若会话一直不空闲，请求会一直挂着，直到 `cancel` 或会话销毁。
+3. **tick 通道命中的超时是静默的**（未修）。`attempt(false)` 不发 notice，所以「一直忙到超时、期间没有 idle 翻转」时队列被清掉却没有任何提示；只有 idle 事件那条通道会回执。用 `/compact_queue ~` 排队不设超时，不会触发这条。修法在 [AGENTS.md](AGENTS.md) 的连带项里记着。
 4. **只对已有/新建 agent 生效**。晚创建的 agent 由 `agent/created` 补挂；但**重启前**已存在的会话不会补注册命令——必须重启。
 5. **每个会话独立**。没有全局队列，也不会把 A 会话的压缩请求带进 B 会话。
 6. **`attempt()` 开头重复调用 `isLive()`**，属无害死代码（AGENTS.md 的已知问题清单里也记着）。
@@ -248,9 +255,9 @@ dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # �
 
 ## 发版
 
-- 当前版本：`package.json` 的 `0.2.0` ↔ 附注 tag `0.2`（**不带 `v`**，与本机其它插件仓的 `0.1` / `0.2` 命名一致）
+- 当前版本：`package.json` 的 `0.3.0` ↔ 附注 tag `0.3`（**不带 `v`**，延续 `0.1` / `0.2` 的命名）
 - 远端：`origin` = `git@github.com:dongasai/dsh_compact_queue.git`
-- 流程：改 `package.json.version` → `git tag -a 0.2 -m …` → **`git push origin main` 与 `git push origin 0.2` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
+- 流程：改 `package.json.version` → `git tag -a 0.3 -m …` → **`git push origin main` 与 `git push origin 0.3` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
 
 ## 相关文件
 
