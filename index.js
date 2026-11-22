@@ -55,7 +55,23 @@
  *
  * ManualCompactionError 的 code 逐一映射（busy 之外都是终态，不再重试，
  * 避免坏循环烧摘要请求）；compactNow 返回 null（没有可压缩范围）视为终态
- * 成功。取消词 `cancel`：排队中 → 撤销；执行中 → abort 其 signal。
+ * 成功。取消词 `cancel`：排队中 → 撤销；执行中 → abort 其 signal；auto
+ * 开着时一并关掉，免得撤销完下一轮 idle 又自动排上。
+ *
+ * ## 五、auto：每次空闲自动压一次，且不递归
+ *
+ * `/compact_queue auto` 切换**本会话**的自动压缩。它只挂在 `agent/status` 的
+ * idle 翻转上（见上「二」），**不启动 tick、不排队**：
+ *
+ * - 一轮 AI 结束：idle → running → idle，最后一次翻转发 idle 事件 → 压一次；
+ * - 压缩自身的 maintenance：agent-loop 的 `status` getter 把 `maintenance` 也算
+ *   `idle`，`setPhase` 不翻转就不发事件 → **压缩不会触发下一次压缩**；
+ * - 完成回执走 `agent.inject`（`send(..., wakeup=false)` + `form:'notice'`），
+ *   不唤醒模型、不产生新的 running→idle 翻转。
+ *
+ * 三条合起来就是「不递归压缩」的保证：只有**新一轮 AI 结束**才会再压一次。
+ * 若压完没有新消息，auto 会安静停在那里，不会因为自己的回执或 maintenance
+ * 反复压。busy 只跳过本次（不排队重试），等下一次 idle 再来。
  */
 
 import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand';
@@ -65,7 +81,9 @@ import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm';
 export const name = 'compact-queue';
 export const inject = ['commands', 'agents', 'agentPresets'];
 
-const USAGE = 'Usage: /compact_queue（排队或立即压缩）或 /compact_queue ~（无限等待）或 /compact_queue cancel（撤销）';
+const USAGE = 'Usage: /compact_queue（排队或立即压缩）或 /compact_queue ~（无限等待）或 /compact_queue auto（切换本会话自动压缩）或 /compact_queue cancel（撤销）';
+const AUTO_ON_TEXT = '已开启本会话自动压缩：每次会话回到空闲时压缩一次（压缩自身不会触发再次压缩）。/compact_queue auto 可关闭。';
+const AUTO_OFF_TEXT = '已关闭本会话自动压缩。';
 const QUEUE_TICK_MS = 2000;
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
 /** 回执展示用的最长等待时长（与 MAX_WAIT_MS 联动，改成小时后不再误显示成分钟数）。 */
@@ -91,6 +109,8 @@ function attach(ctx, agent) {
 	let running = false;
 	/** `/compact_queue ~` 置位：跳过 MAX_WAIT_MS 超时，无限等待本会话空闲。 */
 	let unlimited = false;
+	/** `/compact_queue auto` 置位：本会话每次 idle 翻转自动压一次，默认关闭。 */
+	let autoEnabled = false;
 	let watcher;
 	let activeAbort;
 
@@ -208,9 +228,45 @@ function attach(ctx, agent) {
 		notify(`排队压缩失败：${outcome.text}`, '排队压缩失败');
 	}
 
-	// idle 事件 + tick 双保险（见文件头「二」）。
+	/**
+	 * auto 通道：只在 agent/status 的 idle 翻转里调用一次，不排队、不启动 tick。
+	 * 压缩自身的 maintenance 全程 idle、不发事件，notice 也不唤醒模型，
+	 * 所以压完不会再触发自己（见文件头「五」）——只有新一轮 AI 结束才再压。
+	 */
+	async function autoCompact() {
+		if (!autoEnabled || running || state !== 'none' || !isLive()) return;
+		running = true;
+		const ac = new AbortController();
+		activeAbort = ac;
+		let outcome;
+		try {
+			outcome = await performCompact(ac.signal);
+		} finally {
+			running = false;
+			activeAbort = undefined;
+		}
+		if (ac.signal.aborted) return; // cancel 已撤销：静默收尾，不再回执
+		if (outcome.kind === 'busy') return; // 会话被占用：跳过本次，不排队重试，等下一次 idle
+		if (outcome.kind === 'done') {
+			const { shadowedSeqs, shadowedTokenCount } = outcome.result;
+			notify(
+				`自动压缩完成：压缩了 ${shadowedSeqs.length} 条历史（约 ${shadowedTokenCount} tokens）。`,
+				`自动压缩完成：${shadowedSeqs.length} 条 ~${shadowedTokenCount} tokens`,
+			);
+			return;
+		}
+		if (outcome.kind === 'empty') {
+			notify('自动压缩检查：当前没有可压缩的历史。', '自动压缩：没有可压缩的历史');
+			return;
+		}
+		notify(`自动压缩失败：${outcome.text}`, '自动压缩失败');
+	}
+
+	// idle 事件 + tick 双保险（见文件头「二」）；auto 只吃 idle 翻转（见「五」）。
 	agent.ctx.on('agent/status', ({ status }) => {
-		if (status === 'idle' && state === 'queued') void attempt(true);
+		if (status !== 'idle') return;
+		if (state === 'queued') void attempt(true);
+		else if (autoEnabled) void autoCompact();
 	});
 	agent.ctx.effect(() => () => {
 		if (watcher !== undefined) clearInterval(watcher);
@@ -219,6 +275,7 @@ function attach(ctx, agent) {
 
 	// agent 离场即收摊（timer/status 随 scope 卸载，这里只兜住执行中的 abort 与状态）。
 	const dispose = () => {
+		autoEnabled = false;
 		if (activeAbort !== undefined) activeAbort.abort();
 		stopQueue();
 	};
@@ -227,16 +284,22 @@ function attach(ctx, agent) {
 	/** 该 agent 的命令入口（由宿主层唯一的全局命令按 invocation.agent 分派进来）。 */
 	return async function runCommand(invocation) {
 		const input = invocation.rawInput.trim();
+		if (input === 'auto') {
+			autoEnabled = !autoEnabled;
+			return { kind: 'success', text: autoEnabled ? AUTO_ON_TEXT : AUTO_OFF_TEXT };
+		}
 		if (input === 'cancel') {
+			const wasAuto = autoEnabled;
+			autoEnabled = false; // 连带关掉，免得撤销完下一轮 idle 又自动排上
 			if (state === 'queued') {
 				stopQueue();
-				return { kind: 'success', text: '已撤销排队的压缩。' };
+				return { kind: 'success', text: wasAuto ? '已撤销排队的压缩，并关闭自动压缩。' : '已撤销排队的压缩。' };
 			}
 			if (running && activeAbort !== undefined) {
 				activeAbort.abort();
-				return { kind: 'success', text: '正在取消执行中的压缩。' };
+				return { kind: 'success', text: wasAuto ? '正在取消执行中的压缩，并关闭自动压缩。' : '正在取消执行中的压缩。' };
 			}
-			return { kind: 'error', text: '当前没有排队的压缩。' };
+			return { kind: 'success', text: wasAuto ? '已关闭自动压缩（当前没有排队的压缩）。' : '当前没有排队的压缩。' };
 		}
 		if (input !== '' && input !== '~') return { kind: 'error', text: USAGE };
 		const wantUnlimited = input === '~';
@@ -305,7 +368,7 @@ export function apply(ctx) {
 	ctx.commands.register({
 		definitionId: CommandDefinitionId('@dongasai/dsh-compact-queue'),
 		name: 'compact_queue',
-		description: 'Compact now, or queue the compaction until this session next goes idle',
+		description: 'Compact now, queue until next idle, or toggle per-session auto compaction',
 		handler: (invocation) => {
 			const run = machines.get(invocation.agent) ?? maybeAttach(invocation.agent);
 			if (run === undefined) {

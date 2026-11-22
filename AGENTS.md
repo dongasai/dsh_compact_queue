@@ -14,7 +14,8 @@
 
 - 会话空闲 → 立刻压缩，回执规格与核心 `/compact` 一致（成功时带 `sourceEventSeq` 指向摘要事件）；
 - 会话正忙 → 把请求排进**本会话**内存队列，等这个会话下一次 idle 自动补跑（默认最长等 24 小时；`/compact_queue ~` 不设超时、无限等待）；
-- `/compact_queue cancel` → 排队中撤销、执行中 `abort()`。
+- `/compact_queue auto` → 切换本会话自动压缩：开启后每次 AI 轮次结束（回 idle）压一次，**不递归**，只在本会话内存里（重启即关）；
+- `/compact_queue cancel` → 排队中撤销、执行中 `abort()`；auto 开着时连带关闭。
 
 三条设计红线：
 
@@ -38,9 +39,10 @@ apply(ctx)                            ← 宿主 ctx，拿得到 agents / agentP
                                  ▼
                         attach(ctx, agent)          ← 每个 agent 一份状态机，监听/定时器挂在 agent.ctx
                           ├─ 状态机 state: none | queued | running（+ running 布尔锁）
+                          ├─ autoEnabled 布尔（auto 开关，重启即关，只在本会话内存）
                           ├─ 返回该 agent 的 runCommand()，由宿主层唯一的全局命令按 invocation.agent 分派
-                          ├─ agent.ctx.on('agent/status') → idle 翻转时 attempt(true)
-                          ├─ setInterval(2s).unref()      → attempt(false)   ← 兜底 tick
+                          ├─ agent.ctx.on('agent/status') → idle 翻转时 attempt(true) 或 autoCompact()
+                          ├─ setInterval(2s).unref()      → attempt(false)   ← 兜底 tick（auto 不启动）
                           ├─ performCompact() → ctx.agentPresets.serviceFor(agent,'compaction')
                           │                     .compactNow(agent, signal)   ← 跨 realm 取服务
                           └─ notify() → agent.inject(createUserMessage({ source: { form:'notice' } }))
@@ -59,21 +61,28 @@ apply(ctx)                            ← 宿主 ctx，拿得到 agents / agentP
 status 监听还要挂一个 2s 的 `unref()` tick 兜底；tick 同时承担默认 24 小时超时判定（`~` 排队置
 `unlimited` 后跳过）。两条通道都汇进同一个 `attempt()`，靠 `running` 布尔 + state 机保证不重叠。
 
+**auto 只吃 status 通道**（见 `index.js` 文件头「五」）：`autoCompact()` 只由 idle 翻转调用，
+**不启动 tick、不排队**。正因为 maintenance 不发 idle 事件、notice 用 `wakeup=false` 注入，
+压缩自身不会触发下一次压缩——这是「不递归」的硬依据，别给 auto 补 tick 兜底，那会变递归。
+busy 时只跳过本次，不排队重试。autoEnabled 与排队状态共用 `running` 锁，二者不会重叠。
+
 ## 模块结构图
 
 ```mermaid
 graph TD
-    A["(根) dsh_compact_queue<br/>@dongasai/dsh-compact-queue 0.3.0"] --> B["index.js<br/>宿主插件（唯一源码）"]
+    A["(根) dsh_compact_queue<br/>@dongasai/dsh-compact-queue 0.4.0"] --> B["index.js<br/>宿主插件（唯一源码）"]
     A --> C["cordis.patch.yml<br/>bundle 补丁：宿主层一行 insert"]
     A --> D["package.json<br/>exports / files / dsh.bundle"]
     A --> E["README.md<br/>用法·状态机·失败映射"]
     A --> F["AGENTS.md<br/>本文件（架构与约束）"]
     B --> B1["apply(ctx)<br/>遍历已有 agent + 监听新建"]
     B --> B2["attach(ctx, agent)<br/>每个 agent 一份状态机"]
-    B2 --> B3["命令 handler<br/>/compact_queue [~|cancel]"]
+    B2 --> B3["命令 handler<br/>/compact_queue [~|auto|cancel]"]
     B2 --> B4["attempt()<br/>status 事件 + 2s tick 双通道"]
+    B2 --> B7["autoCompact()<br/>只吃 status idle 翻转，不递归"]
     B2 --> B5["notify()<br/>notice 注入回执"]
     B4 --> B6["performCompact()<br/>serviceFor(agent,'compaction')"]
+    B7 --> B6
 
     click A "./AGENTS.md" "架构与约束"
     click B "./index.js" "唯一源码"
@@ -113,6 +122,8 @@ timer 逻辑时至少覆盖这五条：
 3. **撤销**：排队中 `cancel` → 「已撤销」且不再触发；执行中 `cancel` → abort 生效，回执「压缩已取消」。
 4. **重复入队**：排队中再次 `/compact_queue` → 报「已在队列中（约 N 分钟）」，不产生第二份压缩。
 5. **agent 离场**：会话销毁时定时器清掉、执行中的压缩被 abort、日志无 unhandled rejection。
+6. **auto 不递归**：`/compact_queue auto` 开 → 每轮结束一条 `自动压缩完成：` notice；**不敲新消息不再出第二条**（关键：验证 compression 自身没触发自己）。
+7. **auto 撤销/隔离**：auto 开着时 `cancel` → 回执带「并关闭自动压缩」，之后不再自动压；两会话分别开 auto 互不影响；重启后 auto 默认关。
 
 无可用压缩范围时 `compactNow` 返回 `null`，按终态成功处理（「当前没有可压缩的历史」），不重试——
 这是刻意口径，不是 bug。`ManualCompactionError` 除 `busy` 外全部终态，避免坏循环烧摘要请求。
@@ -123,19 +134,23 @@ timer 逻辑时至少覆盖这五条：
 - 注释写**为什么**（哪个官方接缝、哪条源码注释支撑），不写「这里做了什么」的复述；文件头用编号小节承载设计决策。
 - 用户可见文案一律中文，且与核心 `/compact` 的失败口径对齐（`FAILURE_TEXT` 逐条映射 `ManualCompactionError.code`）。
 - 新增/修改回执必须保持 `form: 'notice'`；任何时候都不得把系统回执标成 `kind: 'user'`。
-- 常量集中在文件头（`QUEUE_TICK_MS`、`MAX_WAIT_MS`、`MAX_WAIT_TEXT`），文案常量（`USAGE`、`FAILURE_TEXT`）放在函数之前；`~` 的无限等待由 `unlimited` 布尔控制，跳过 `MAX_WAIT_MS` 判定。
+- 常量集中在文件头（`QUEUE_TICK_MS`、`MAX_WAIT_MS`、`MAX_WAIT_TEXT`），文案常量（`USAGE`、`AUTO_ON_TEXT`、`AUTO_OFF_TEXT`、`FAILURE_TEXT`）放在函数之前；`~` 的无限等待由 `unlimited` 布尔控制，跳过 `MAX_WAIT_MS` 判定。
+- auto 通道与排队通道共用 `running` 锁与 `activeAbort`：处理 auto 时先判 `state !== 'none'` 让排队优先，busy 只跳过不排队；新增触发通道必须同时核对「不重叠」与「不递归」两条。
 
 ## AI 使用指引
 
 - **注册位置是硬约束**：命令只在宿主 `ctx.commands.register()` 上注册一次，agent 维度靠 `invocation.agent` 分流——`agent.ctx.commands` 在宿主层插件里必然抛错（见上表）。但监听器/定时器/teardown 仍走 `agent.ctx.on/effect`：那是 Context 自身成员，不触发服务解析，且随 agent scope 卸载。
 - **改队列逻辑前先读 `attempt()` 全文**：`state`、`running`、`activeAbort`、`watcher` 四个变量互相牵制，只改一条通道（status 或 tick）会破坏「不重叠」保证。
 - **别顺手"优化"乐观排队**：handler 先置 `queued` 再立刻试一次是刻意设计——省掉二次竞态判定，代价只是忙时多一次无副作用调用。
+- **别给 auto 补 tick 兜底**：auto 的"不递归"完全依赖 maintenance 不发 idle 事件；一旦给它加轮询/排队，压缩自己就会触发下一次压缩，变成无限烧摘要请求。busy 跳过本次是刻意的。
 - **两条已知问题在 README 末尾有账**：① tick 通道命中 24 小时超时是静默取消（`attempt(false)` 不发 notice，`~` 排队不设超时可绕过）；② `attempt()` 开头连续两次 `isLive()` 属死代码。修任一条要同步更新 README 的「已知边界」。
-- **发版口径**：`package.json.version` 与 tag 同步（当前 `0.3.0` ↔ 附注 tag `0.3`，不带 `v`，与 `gitea_task_issues` 一致）；远端 `origin` = `git@github.com:dongasai/dsh_compact_queue.git`，发版＝本地提交 → `git tag -a 0.3 -m …` → `git push origin main` 与 `git push origin 0.3` 两条都推（只推分支会丢 tag）。
+- **发版口径**：`package.json.version` 与 tag 同步（当前 `0.4.0` ↔ 附注 tag `0.4`，不带 `v`，与 `gitea_task_issues` 一致）；远端 `origin` = `git@github.com:dongasai/dsh_compact_queue.git`，发版＝本地提交 → `git tag -a 0.4 -m …` → `git push origin main` 与 `git push origin 0.4` 两条都推（只推分支会丢 tag）。
 - 提交信息沿用 `类型(范围): 中文描述`（已落地的两条：`功能(压缩排队):`、`文档(接入):`）。
 
 ## 变更记录
 
+- **2026-11-22T12:10+08:00** 新增 `/compact_queue auto`（每次空闲自动压缩，仅限当前会话，不递归）：`attach()` 增 `autoEnabled` 布尔，新增 `autoCompact()` 只由 `agent/status` 的 idle 翻转调用（不启动 tick、不排队，靠 maintenance 不发事件 + notice `wakeup=false` 保证不递归）；`cancel` 连带关 auto；`dispose` 清 autoEnabled。USAGE 加 auto、新增 `AUTO_ON_TEXT`/`AUTO_OFF_TEXT`，命令 description 更新。README（功能/用法/auto 专节/回执/排错/验证/已知边界）与本文件（愿景/架构图/双通道/模块图/测试/编码规范/AI 指引）同步更新。已纳入 `0.4`（tag 已建，远端待推）；本机 web profile 仍指向 0.2 副本，需切依赖 + 重启才生效。
+- **2026-11-22T12:15+08:00** 发版 `0.4`：承接上条的 `/compact_queue auto`，`package.json.version` → `0.4.0`，附注 tag `0.4` 已建（指向本仓 HEAD）。README / AGENTS / `.agents/index.json` 的版本号、钉版本示例、发版口径、tag 清单同步到 0.4。**推送未完成**：本执行环境到 GitHub 的 SSH（22）与 HTTPS（443）均超时不可达，`git push origin main` 与 `git push origin 0.4` 挂起后被终止；需在能联网的环境手动补推这两条 ref（只推分支会漏 tag）。本机 web profile 仍指向 `#0.2`，未随发版切换（切依赖 + 重启是独立动作）。
 - **2026-11-21T17:47+08:00** 发版 `0.3`：`package.json.version` → `0.3.0`，附注 tag `0.3` 随 `main` 一并推送到 origin。README / AGENTS / `.agents/index.json` 的版本号、钉版本示例、发版口径、tag 清单同步到 0.3；`package.json` 既有的去 `private` + `publishConfig.public` 改动随本次一并提交（尚未发 npm），文档里对应的 `private: true` 描述已改为实际状态。本机 web profile 仍指向 `#0.2`，未随发版切换。
 - **2026-11-21T17:36+08:00** 排队默认时长 30 分钟 → 24 小时，并新增 `/compact_queue ~`（无限等待）：`MAX_WAIT_MS` 改 24h，新增联动文案常量 `MAX_WAIT_TEXT` 避免回执显示「1440 分钟」；`attach()` 增 `unlimited` 布尔，`~` 置位后跳过超时判定、`stopQueue()` 复位；USAGE 与忙时回执区分「最长等待 24 小时」/「无限等待，不设超时」。README（功能/用法/回执对照/排错/验证/已知边界）与本文件（愿景/双通道/模块图/测试/编码规范/已知问题）同步更新。同日发版 `0.3`。
 - **2026-10-21T11:20+08:00** 发版 `0.2`：`package.json.version` → `0.2.0`，附注 tag `0.2` 随 `main` 一并推送。实测依据：宿主命令目录里 `compact_queue` 与 `compact`/`permission`/`plan` 并列；忙时排队后由 idle 通道补跑，回执 `排队压缩完成：压缩了 217 条历史（约 144578 tokens）。`。`.agents/index.json` 同步：命令 `scope` 由 `agent` 改为 `host`、`registeredVia` 改 `ctx.commands.register()`、版本与 tags 更新；当日本机 profile 依赖由本地 tarball 切到 `github:dongasai/dsh_compact_queue#0.2`（装完 `index.js` md5 与本仓一致，`import()` 与 `--dump-config` 均通过）。

@@ -9,6 +9,8 @@
 本插件**不改核心**，另注册一条命令 `/compact_queue`：空闲时立刻压缩；忙时把请求排进**本会话**
 队列，等这个会话下一次 idle 自动补跑；排队中随时能撤销。
 
+npm publish --registry https://registry.npmjs.org/ --access public
+
 | 文档 | 只写 | 不写 |
 | --- | --- | --- |
 | **本文件** | 怎么用：装、用法、回执、排错、验证、边界 | 设计取舍、给 agent 的约束 |
@@ -21,7 +23,8 @@
 | --- | --- |
 | `/compact_queue` | 空闲 → 立即压缩；忙 → 排队并回执「已排队，最长等 24 小时」 |
 | `/compact_queue ~` | 同上，但排队**不设超时**（无限等待本会话空闲），适合长任务会话 |
-| `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort 其 signal |
+| `/compact_queue auto` | **切换本会话自动压缩**：开启后每次 AI 轮次结束（回到 idle）自动压一次，**不递归**（压缩自身不会再触发压缩），仅限当前会话 |
+| `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort 其 signal；auto 开着时连带关闭 |
 | 自动补跑 | 本会话下一次 idle 触发；`agent/status` 翻转与 2 秒兜底 tick 双通道，不漏触发、不重叠执行 |
 | 回执不吵人 | 后台完成/失败以折叠 notice 注入，不唤醒模型、不额外烧 token |
 | 失败不重试 | `ManualCompactionError` 除 `busy` 外一律终态，避免坏循环反复烧摘要请求 |
@@ -59,7 +62,7 @@ dsh plugin --profile web add github:dongasai/dsh_compact_queue
 # 或
 dsh plugin --profile web add git+https://github.com/dongasai/dsh_compact_queue.git
 # 钉版本（URL 后加 #<tag>，锁到某个发布版本来复现问题 / 稳定使用）
-dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.3
+dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.4
 ```
 
 `dsh plugin --profile <name> <pnpm args>` 把参数交给
@@ -69,8 +72,8 @@ dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.3
 - `--profile` **必填**（不写直接报 `required option '--profile <name> not specified'`）。
 - **必须带 `git+` 或 `github:` 前缀**。`git@github.com:owner/repo.git` 这种 scp 写法不会被认成
   git spec，pnpm 会把它当路径，装出一条指向不存在目录的 `link:` 死链。
-- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.3`），tag / 分支 / commit 都行；
-  本仓库当前 tag 是 `0.3`，对应 `package.json` 的 `0.3.0` —— 不带 `#` 则跟 `main` 走，
+- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.4`），tag / 分支 / commit 都行；
+  本仓库当前 tag 是 `0.4`，对应 `package.json` 的 `0.4.0` —— 不带 `#` 则跟 `main` 走，
   每次装到的都可能是新代码。
 - pnpm 默认会拦 `prepare` 等依赖构建脚本；本包**没有任何构建步骤**（纯 ESM 源码 + 一个 cordis
   补丁，没有编译产物），不会遇到。
@@ -125,7 +128,8 @@ dsh plugin --profile web remove @dongasai/dsh-compact-queue
 | --- | --- |
 | `/compact_queue` | 立即尝试；会话忙则排队（回执写明「已排队，最长等 24 小时」与撤销方式） |
 | `/compact_queue ~` | 立即尝试；会话忙则排队且**不设超时**（回执写明「无限等待，不设超时」） |
-| `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort；都没有 → 报「当前没有排队的压缩」 |
+| `/compact_queue auto` | 切换本会话自动压缩（开/关）：开启后每次回到 idle 自动压一次；关掉后不再自动压 |
+| `/compact_queue cancel` | 排队中 → 撤销；执行中 → abort；都没有 → 报「当前没有排队的压缩」；同时关掉 auto |
 | `/compact_queue <其它>` | 回用法提示，不执行任何压缩 |
 
 一次典型交互（忙时）：
@@ -146,6 +150,33 @@ dsh ▸ 排队压缩完成：压缩了 42 条历史（约 18304 tokens）。    
 忙时想彻底不限等待时长，用 `/compact_queue ~`：回执里的「最长等待 24 小时」换成
 「无限等待，不设超时」，其余行为一致；一直挂到本会话空闲或被 `cancel`。
 
+### auto：每次空闲自动压缩（不递归）
+
+`/compact_queue auto` 是**本会话**的开关：开启后，每次这一轮 AI 结束、会话回到 idle，
+就自动压一次历史，不用每轮手敲。再敲一次 `auto` 关闭，`cancel` 也会连带关闭。
+
+它**不会递归压缩**，原因有三条（源码文件头「五」有详细论证）：
+
+1. 自动压缩只挂在 `agent/status` 的 idle **翻转**上；一轮 AI 是 idle→running→idle，
+   只有最后一次翻转触发；
+2. 压缩自身的 maintenance 阶段，DSH 把 `maintenance` 也算作 `idle`，状态不翻转就不发
+   事件——所以压缩过程不会触发下一次压缩；
+3. 完成回执走 `form:'notice'` 的 inject，不唤醒模型、不产生新的轮次。
+
+因此：压完没有新消息时，auto 会安静停着；只有**新一轮 AI 真的结束**才再压一次。
+忙时（`busy`）只跳过本次，不排队、不重试，等下一次 idle。auto 与手动排队互斥，共用
+一个 `running` 锁，不会重叠执行。开启/关闭只影响当前会话，别的会话不受影响。
+
+每次自动压完（哪怕是「没有可压缩的历史」）都会发一条折叠 notice，回执如下：
+
+| 场景 | 原文 |
+| --- | --- |
+| 开启 | `已开启本会话自动压缩：每次会话回到空闲时压缩一次（压缩自身不会触发再次压缩）。/compact_queue auto 可关闭。` |
+| 关闭 | `已关闭本会话自动压缩。` |
+| 自动压成功 | `自动压缩完成：压缩了 N 条历史（约 M tokens）。` |
+| 自动压无历史 | `自动压缩检查：当前没有可压缩的历史。` |
+| 自动压失败 | `自动压缩失败：<原因>` |
+
 ### 回执原文对照
 
 排错时按文案直接查表：
@@ -156,10 +187,12 @@ dsh ▸ 排队压缩完成：压缩了 42 条历史（约 18304 tokens）。    
 | 忙、已排队（`~`） | `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（无限等待，不设超时）。/compact_queue cancel 可撤销。` |
 | 重复入队 | `压缩已在队列中（已排队约 N 分钟）。/compact_queue cancel 可撤销。` |
 | 正在压缩 | `压缩正在执行中。` |
-| 撤销排队 | `已撤销排队的压缩。` |
-| 取消执行中 | `正在取消执行中的压缩。` |
-| 撤销空操作 | `当前没有排队的压缩。` |
-| 参数不对 | `Usage: /compact_queue（排队或立即压缩）或 /compact_queue ~（无限等待）或 /compact_queue cancel（撤销）` |
+| 开启 auto | `已开启本会话自动压缩：每次会话回到空闲时压缩一次（压缩自身不会触发再次压缩）。/compact_queue auto 可关闭。` |
+| 关闭 auto | `已关闭本会话自动压缩。` |
+| 撤销排队 | `已撤销排队的压缩。`；若 auto 开着则 `已撤销排队的压缩，并关闭自动压缩。` |
+| 取消执行中 | `正在取消执行中的压缩。`；若 auto 开着则 `正在取消执行中的压缩，并关闭自动压缩。` |
+| 撤销空操作 | `当前没有排队的压缩。`；若 auto 开着则 `已关闭自动压缩（当前没有排队的压缩）。` |
+| 参数不对 | `Usage: /compact_queue（排队或立即压缩）或 /compact_queue ~（无限等待）或 /compact_queue auto（切换本会话自动压缩）或 /compact_queue cancel（撤销）` |
 | 预设缺服务 | `本会话挂载的 agent preset 没有提供 compaction 服务，无法压缩。` |
 | 排队补跑成功 | `排队压缩完成：压缩了 N 条历史（约 M tokens）。` |
 | 排队补跑无历史 | `排队压缩完成前检查：当前没有可压缩的历史。` |
@@ -201,14 +234,15 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 | 槽位 / 服务 | 占用 | 说明 |
 | --- | --- | --- |
 | `commands`（宿主层全局） | 命令名 `compact_queue` | 只注册一次；handler 用 `invocation.agent` 找该会话的排队状态机 |
-| `agent/status` 事件 | 监听 `idle` 翻转 | 双通道之一，挂在 `agent.ctx` |
-| 定时器 | 2 秒 `unref()` tick | 双通道之二，兼做默认 24 小时超时判定；`~` 排队跳过超时 |
+| `agent/status` 事件 | 监听 `idle` 翻转 | 双通道之一，挂在 `agent.ctx`；auto 模式也只吃这条通道（不启动 tick） |
+| 定时器 | 2 秒 `unref()` tick | 双通道之二，兼做默认 24 小时超时判定；`~` 排队跳过超时；auto 模式不启动它 |
 | HTTP 路由 / UI 槽位 / 其它服务 | 不占 | 本包没有浏览器半边 |
 
 ## 与 Agent 的关系
 
 - 命令由**人**敲；agent 那边看到的是压缩之后的历史，不需要（也无法）自己触发排队。
-- 排队完成的 notice 是**系统回执**（`source.kind: 'compact-queue'`、`form: 'notice'`），不唤醒模型、不计为你发的消息。
+- 排队/自动压缩完成的 notice 是**系统回执**（`source.kind: 'compact-queue'`、`form: 'notice'`），不唤醒模型、不计为你发的消息。
+- auto 的开关也由人敲命令控制（`auto` 开/关、`cancel` 连带关）；agent 不会自己开启它。开启状态只在该会话内存里，重启即关闭。
 - 核心 `/compact` 行为一字未改；本插件失败也不影响那条命令。
 
 ## 排错
@@ -216,11 +250,13 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | 命令补全里没有 `/compact_queue` | 没重启；或 Web 上装了没点「立即启用」；或装到了别的 profile | 按「安装 → 装完确认」逐条核：`dsh --profile web --dump-config \| grep -A1 dsh-compact-queue` 有没有那三行 |
+| **敲了 `/compact_queue auto` 被当成普通消息发给模型**（命令没被拦截） | 运行中的实例在装包前就启动了、没重启；或 bundle 没被选中 | 重启 dsh 服务并刷新页面；再敲 `/` 看补全菜单有没有 `compact_queue`。语法本身没问题：`parseCommand` 支持下划线与空格参数 |
 | 一直回「已排队」不下去 | 会话确实一直被占用（长任务、subagent、其它 maintenance 占着） | 等本轮结束；或 `/compact_queue cancel` 撤销 |
+| auto 开着但一次都没自动压 | 会话没有产生 idle 翻转（一直 running），或还没发过新消息 | 让一轮 AI 正常结束；auto 只在回 idle 时触发，且不会自己触发自己 |
 | 回「本会话挂载的 agent preset 没有提供 compaction 服务」 | 当前 preset 没挂 compaction 实现 | 换回带压缩的 preset；这不是排队逻辑的问题 |
 | 排队到 24 小时突然消失、没有任何提示 | tick 通道命中超时的已知静默缺陷 | 用 `/compact_queue ~` 排队可绕过超时；详见「已知边界」第 3 条 |
-| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.3` |
-| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.3`） |
+| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.4` |
+| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.4`） |
 
 ## 怎么验证
 
@@ -230,7 +266,7 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 node --check index.js                                        # 语法：无输出即通过
 npm pack --dry-run                                           # 应恰好 4 个文件（index.js / cordis.patch.yml / package.json / README.md）
 grep -n 'dsh-compact-queue' ~/.dsh/profiles/web/package.json  # 两行：dependencies + dsh.profile.bundles（安装时自动登记）
-git ls-remote --tags origin                                  # 当前应看到 0.1、0.2、0.3 及各自指向的提交
+git ls-remote --tags origin                                  # 当前应看到 0.1、0.2、0.3、0.4 及各自指向的提交
 dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # 期望三行，见「装完确认」
 ```
 
@@ -241,7 +277,10 @@ dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # �
 3. 排队中 `/compact_queue cancel` → `已撤销排队的压缩。`，之后不再触发
 4. 排队中再敲 `/compact_queue` → `压缩已在队列中（已排队约 N 分钟）。`，不产生第二份压缩
 5. 忙时 `/compact_queue ~` → 回执写「无限等待，不设超时」；会话转 idle 后仍会补跑（超时不会清掉它）
-6. 关掉该会话 → 后台无残留定时器、无 unhandled rejection（看宿主日志）
+6. `/compact_queue auto` → 回「已开启…」；之后每轮 AI 结束收到一条 `自动压缩完成：…` notice；**不敲新消息时不再出现第二条**（验证不递归）
+7. auto 开着时 `/compact_queue cancel` → 回执带「并关闭自动压缩」，之后再结束一轮不再自动压
+8. 两个会话分别开 auto：A 开不影响 B；重启后 auto 默认关闭
+9. 关掉该会话 → 后台无残留定时器、无 unhandled rejection（看宿主日志）
 
 ## 已知边界
 
@@ -249,15 +288,17 @@ dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # �
 2. **默认最长等 24 小时**，超过就清队列；`/compact_queue ~` 可跳过超时、无限等待。代价：默认档下真忙超过一天的会话会丢这次请求；`~` 档下若会话一直不空闲，请求会一直挂着，直到 `cancel` 或会话销毁。
 3. **tick 通道命中的超时是静默的**（未修）。`attempt(false)` 不发 notice，所以「一直忙到超时、期间没有 idle 翻转」时队列被清掉却没有任何提示；只有 idle 事件那条通道会回执。用 `/compact_queue ~` 排队不设超时，不会触发这条。修法在 [AGENTS.md](AGENTS.md) 的连带项里记着。
 4. **只对已有/新建 agent 生效**。晚创建的 agent 由 `agent/created` 补挂；但**重启前**已存在的会话不会补注册命令——必须重启。
-5. **每个会话独立**。没有全局队列，也不会把 A 会话的压缩请求带进 B 会话。
-6. **`attempt()` 开头重复调用 `isLive()`**，属无害死代码（AGENTS.md 的已知问题清单里也记着）。
-7. **无自动化测试**。状态机与定时器只能手验，验证清单见上一节。
+5. **每个会话独立**。没有全局队列，也不会把 A 会话的压缩请求带进 B 会话；auto 开关同样按会话隔离。
+6. **auto 开关不持久化**。只在该 agent 的内存状态里，重启/会话销毁即关闭；每次要用都得重新敲 `auto`。
+7. **auto 下 busy 只跳过、不重试**。会话被占用时那次 idle 翻转白白错过，要等下一次轮次结束才压；这是刻意的——不排队就没有超时/静默取消那类问题，也不会自己烧摘要请求。
+8. **`attempt()` 开头重复调用 `isLive()`**，属无害死代码（AGENTS.md 的已知问题清单里也记着）。
+9. **无自动化测试**。状态机与定时器只能手验，验证清单见上一节。
 
 ## 发版
 
-- 当前版本：`package.json` 的 `0.3.0` ↔ 附注 tag `0.3`（**不带 `v`**，延续 `0.1` / `0.2` 的命名）
+- 当前版本：`package.json` 的 `0.4.0` ↔ 附注 tag `0.4`（**不带 `v`**，延续 `0.1` / `0.2` / `0.3` 的命名）
 - 远端：`origin` = `git@github.com:dongasai/dsh_compact_queue.git`
-- 流程：改 `package.json.version` → `git tag -a 0.3 -m …` → **`git push origin main` 与 `git push origin 0.3` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
+- 流程：改 `package.json.version` → `git tag -a 0.4 -m …` → **`git push origin main` 与 `git push origin 0.4` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
 
 ## 相关文件
 
