@@ -1,11 +1,19 @@
 /**
  * @module @dongasai/dsh-compact-queue
  *
- * **命令 `/compact_queue`：压缩排队。**
+ * **命令族 `/compact_queue*`：压缩排队。**
  *
  * 核心 `/compact`（@deepseek-ai/dsh-command-compact）在会话忙时只回一句
- * busy 错误就丢弃请求。本插件不改核心，另注册一条命令：空闲时立即压缩，
- * 忙时把请求排在**本会话**队列里，等下一次 idle 自动补跑。
+ * busy 错误就丢弃请求。本插件不改核心，另注册四条**无参数**命令：
+ *
+ * - `/compact_queue`：空闲时立即压缩；忙时排进**本会话**队列，最长等 24 小时；
+ * - `/compact_queue_unlimited`：同上，但不设超时，一直等到本会话空闲；
+ * - `/compact_queue_auto`：切换本会话每次空闲自动压缩（见「五」）；
+ * - `/compact_queue_cancel`：撤销排队 / abort 执行中的压缩，并顺手关掉 auto。
+ *
+ * 不用参数是有原因的：DSH 的斜杠命令输入 UX 只认命令名，带空格的
+ * `/compact_queue auto` 会被整段当成普通消息发给模型（命令解析器的
+ * `rawInput` 虽在，但前端不会把参数送进来）。所以每种动作各占一个命令名。
  *
  * ## 一、命令在宿主层全局注册，状态机按 agent 分流
  *
@@ -39,8 +47,8 @@
  * `agent/status` 只在 `idle ⇄ running` **字符串翻转**时发射；`compactNow`
  * 内部的 maintenance（idle→maintenance→idle）全程都是 idle，不发事件。所以
  * 除 status 监听外再挂一个低频 tick（QUEUE_TICK_MS）兜底，并在 tick 里做
- * 最长等待（MAX_WAIT_MS）超时判定；`/compact_queue ~` 排入的请求 unlimited=true，
- * 跳过超时判定，一直等到本会话空闲（或被 cancel / 会话销毁）。tick 用 `unref()`，不拖进程退出；两条
+ * 最长等待（MAX_WAIT_MS）超时判定；`/compact_queue_unlimited` 排入的请求 unlimited=true，
+ * 跳过超时判定，一直等到本会话空闲（或被 `/compact_queue_cancel` / 会话销毁）。tick 用 `unref()`，不拖进程退出；两条
  * 通道都进同一个 `attempt()`，`running` 布尔 + state 机保证不重叠执行。
  *
  * ## 三、回执不伪装成用户消息
@@ -55,12 +63,12 @@
  *
  * ManualCompactionError 的 code 逐一映射（busy 之外都是终态，不再重试，
  * 避免坏循环烧摘要请求）；compactNow 返回 null（没有可压缩范围）视为终态
- * 成功。取消词 `cancel`：排队中 → 撤销；执行中 → abort 其 signal；auto
+ * 成功。取消命令 `/compact_queue_cancel`：排队中 → 撤销；执行中 → abort 其 signal；auto
  * 开着时一并关掉，免得撤销完下一轮 idle 又自动排上。
  *
  * ## 五、auto：每次空闲自动压一次，且不递归
  *
- * `/compact_queue auto` 切换**本会话**的自动压缩。它只挂在 `agent/status` 的
+ * `/compact_queue_auto` 切换**本会话**的自动压缩。它只挂在 `agent/status` 的
  * idle 翻转上（见上「二」），**不启动 tick、不排队**：
  *
  * - 一轮 AI 结束：idle → running → idle，最后一次翻转发 idle 事件 → 压一次；
@@ -81,8 +89,8 @@ import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm';
 export const name = 'compact-queue';
 export const inject = ['commands', 'agents', 'agentPresets'];
 
-const USAGE = 'Usage: /compact_queue（排队或立即压缩）或 /compact_queue ~（无限等待）或 /compact_queue auto（切换本会话自动压缩）或 /compact_queue cancel（撤销）';
-const AUTO_ON_TEXT = '已开启本会话自动压缩：每次会话回到空闲时压缩一次（压缩自身不会触发再次压缩）。/compact_queue auto 可关闭。';
+const USAGE = '可用命令：/compact_queue（排队或立即压缩）· /compact_queue_unlimited（无限等待）· /compact_queue_auto（切换本会话自动压缩）· /compact_queue_cancel（撤销）';
+const AUTO_ON_TEXT = '已开启本会话自动压缩：每次会话回到空闲时压缩一次（压缩自身不会触发再次压缩）。/compact_queue_auto 可关闭。';
 const AUTO_OFF_TEXT = '已关闭本会话自动压缩。';
 const QUEUE_TICK_MS = 2000;
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
@@ -107,9 +115,9 @@ function attach(ctx, agent) {
 	let state = 'none';
 	let enqueuedAt = 0;
 	let running = false;
-	/** `/compact_queue ~` 置位：跳过 MAX_WAIT_MS 超时，无限等待本会话空闲。 */
+	/** `/compact_queue_unlimited` 置位：跳过 MAX_WAIT_MS 超时，无限等待本会话空闲。 */
 	let unlimited = false;
-	/** `/compact_queue auto` 置位：本会话每次 idle 翻转自动压一次，默认关闭。 */
+	/** `/compact_queue_auto` 置位：本会话每次 idle 翻转自动压一次，默认关闭。 */
 	let autoEnabled = false;
 	let watcher;
 	let activeAbort;
@@ -281,14 +289,24 @@ function attach(ctx, agent) {
 	};
 	agent.ctx.effect(dispose, 'compact-queue teardown');
 
-	/** 该 agent 的命令入口（由宿主层唯一的全局命令按 invocation.agent 分派进来）。 */
-	return async function runCommand(invocation) {
-		const input = invocation.rawInput.trim();
-		if (input === 'auto') {
+	/**
+	 * 该 agent 的命令入口。宿主层注册的四条命令共用此 handler，用 mode 区分动作，
+	 * 再按 invocation.agent 落到各自状态机。若某客户端真能把 rawInput 送进来，
+	 * 旧写法 `/compact_queue auto|~|cancel` 仍然兼容，只是不再依赖它。
+	 */
+	return async function runCommand(mode, invocation) {
+		if (mode === 'normal') {
+			const input = invocation.rawInput.trim();
+			if (input === 'auto') mode = 'auto';
+			else if (input === 'cancel') mode = 'cancel';
+			else if (input === '~') mode = 'unlimited';
+			else if (input !== '') return { kind: 'error', text: USAGE };
+		}
+		if (mode === 'auto') {
 			autoEnabled = !autoEnabled;
 			return { kind: 'success', text: autoEnabled ? AUTO_ON_TEXT : AUTO_OFF_TEXT };
 		}
-		if (input === 'cancel') {
+		if (mode === 'cancel') {
 			const wasAuto = autoEnabled;
 			autoEnabled = false; // 连带关掉，免得撤销完下一轮 idle 又自动排上
 			if (state === 'queued') {
@@ -301,12 +319,11 @@ function attach(ctx, agent) {
 			}
 			return { kind: 'success', text: wasAuto ? '已关闭自动压缩（当前没有排队的压缩）。' : '当前没有排队的压缩。' };
 		}
-		if (input !== '' && input !== '~') return { kind: 'error', text: USAGE };
-		const wantUnlimited = input === '~';
+		const wantUnlimited = mode === 'unlimited';
 		if (running || state === 'running') return { kind: 'error', text: '压缩正在执行中。' };
 		if (state === 'queued') {
 			const waitedMin = Math.max(1, Math.round((Date.now() - enqueuedAt) / 60000));
-			return { kind: 'error', text: `压缩已在队列中（已排队约 ${waitedMin} 分钟）。/compact_queue cancel 可撤销。` };
+			return { kind: 'error', text: `压缩已在队列中（已排队约 ${waitedMin} 分钟）。/compact_queue_cancel 可撤销。` };
 		}
 		// 乐观排队后立刻试一次：busy 时队列已经就位，省去二次竞态判定。
 		state = 'queued';
@@ -324,7 +341,7 @@ function attach(ctx, agent) {
 			const waitDesc = wantUnlimited ? '无限等待，不设超时' : `最长等待 ${MAX_WAIT_TEXT}`;
 			return {
 				kind: 'success',
-				text: `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（${waitDesc}）。/compact_queue cancel 可撤销。`,
+				text: `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（${waitDesc}）。/compact_queue_cancel 可撤销。`,
 			};
 		}
 		stopQueue();
@@ -364,19 +381,27 @@ export function apply(ctx) {
 		maybeAttach(agent);
 	});
 
-	// 宿主层全局注册（见文件头「一」）。disposer 由 Cordis 挂在插件 fiber 上。
-	ctx.commands.register({
-		definitionId: CommandDefinitionId('@dongasai/dsh-compact-queue'),
-		name: 'compact_queue',
-		description: 'Compact now, queue until next idle, or toggle per-session auto compaction',
-		handler: (invocation) => {
-			const run = machines.get(invocation.agent) ?? maybeAttach(invocation.agent);
-			if (run === undefined) {
-				return { kind: 'error', text: '本会话的压缩排队状态机尚未就绪，请重新发送一次。' };
-			}
-			return run(invocation);
-		},
-	});
+	// 宿主层全局注册（见文件头「一」）。四条无参命令共用同一状态机，按 mode 分派。
+	const COMMANDS = [
+		{ name: 'compact_queue', mode: 'normal', description: 'Compact now, or queue until next idle (max 24h)' },
+		{ name: 'compact_queue_unlimited', mode: 'unlimited', description: 'Compact now, or queue until next idle with no timeout' },
+		{ name: 'compact_queue_auto', mode: 'auto', description: 'Toggle per-session auto compaction on every idle' },
+		{ name: 'compact_queue_cancel', mode: 'cancel', description: 'Cancel queued/running compaction and turn auto off' },
+	];
+	for (const def of COMMANDS) {
+		ctx.commands.register({
+			definitionId: CommandDefinitionId('@dongasai/dsh-compact-queue'),
+			name: def.name,
+			description: def.description,
+			handler: (invocation) => {
+				const run = machines.get(invocation.agent) ?? maybeAttach(invocation.agent);
+				if (run === undefined) {
+					return { kind: 'error', text: '本会话的压缩排队状态机尚未就绪，请重新发送一次。' };
+				}
+				return run(def.mode, invocation);
+			},
+		});
+	}
 }
 
 function isLive(ctx, agent) {
