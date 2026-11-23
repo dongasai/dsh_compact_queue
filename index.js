@@ -80,6 +80,14 @@
  * 三条合起来就是「不递归压缩」的保证：只有**新一轮 AI 结束**才会再压一次。
  * 若压完没有新消息，auto 会安静停在那里，不会因为自己的回执或 maintenance
  * 反复压。busy 只跳过本次（不排队重试），等下一次 idle 再来。
+ *
+ * ## 六、最少历史消息数门槛
+ *
+ * 核心 `compactNow` 只要 2 条 surface 节点就肯压（`selectCompactableRange` 传
+ * `retainTokens=0`，首条是 system 消息时要 3 条）。太短的会话压一次只烧摘要
+ * 请求、换不回多少上下文，所以三条触发路径（手动命令、排队补跑、auto）统一
+ * 在调用 `compactNow` 之前检查 `agent.session.surface.nodes.length`：不足
+ * MIN_MESSAGES 就跳过，连摘要请求都不发。门槛只在插件侧，核心没改。
  */
 
 import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand';
@@ -90,8 +98,10 @@ export const name = 'compact-queue';
 export const inject = ['commands', 'agents', 'agentPresets'];
 
 const USAGE = '可用命令：/compact_queue（排队或立即压缩）· /compact_queue_unlimited（无限等待）· /compact_queue_auto（切换本会话自动压缩）· /compact_queue_cancel（撤销）';
-const AUTO_ON_TEXT = '已开启本会话自动压缩：每次会话回到空闲时压缩一次（压缩自身不会触发再次压缩）。/compact_queue_auto 可关闭。';
+const AUTO_ON_TEXT = '已开启本会话自动压缩：每次会话回到空闲时压缩一次（历史不足 10 条会跳过，压缩自身不会触发再次压缩）。/compact_queue_auto 可关闭。';
 const AUTO_OFF_TEXT = '已关闭本会话自动压缩。';
+/** 历史消息数低于此值不压缩：核心 2 条就肯压，太短的会话只烧摘要请求、换不回上下文。 */
+const MIN_MESSAGES = 10;
 const QUEUE_TICK_MS = 2000;
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
 /** 回执展示用的最长等待时长（与 MAX_WAIT_MS 联动，改成小时后不再误显示成分钟数）。 */
@@ -129,6 +139,17 @@ function attach(ctx, agent) {
 			return false;
 		}
 	};
+
+	/** 当前会话 surface 节点数；拿不到返回 null（不拦截，交给核心判断）。 */
+	const messageCount = () => {
+		try {
+			const count = agent.session?.surface?.nodes?.length;
+			return typeof count === 'number' ? count : null;
+		} catch {
+			return null;
+		}
+	};
+	const belowMin = (count) => count !== null && count < MIN_MESSAGES;
 
 	const stopQueue = () => {
 		state = 'none';
@@ -208,6 +229,15 @@ function attach(ctx, agent) {
 			}
 			return;
 		}
+		const count = messageCount();
+		if (belowMin(count)) {
+			stopQueue();
+			notify(
+				`排队压缩跳过：当前历史消息 ${count} 条，不足 ${MIN_MESSAGES} 条，本次未执行。`,
+				`排队压缩跳过：${count}/${MIN_MESSAGES} 条`,
+			);
+			return;
+		}
 		running = true;
 		const ac = new AbortController();
 		activeAbort = ac;
@@ -243,6 +273,14 @@ function attach(ctx, agent) {
 	 */
 	async function autoCompact() {
 		if (!autoEnabled || running || state !== 'none' || !isLive()) return;
+		const count = messageCount();
+		if (belowMin(count)) {
+			notify(
+				`自动压缩跳过：当前历史消息 ${count} 条，不足 ${MIN_MESSAGES} 条，未执行压缩。`,
+				`自动压缩跳过：${count}/${MIN_MESSAGES} 条`,
+			);
+			return;
+		}
 		running = true;
 		const ac = new AbortController();
 		activeAbort = ac;
@@ -324,6 +362,10 @@ function attach(ctx, agent) {
 		if (state === 'queued') {
 			const waitedMin = Math.max(1, Math.round((Date.now() - enqueuedAt) / 60000));
 			return { kind: 'error', text: `压缩已在队列中（已排队约 ${waitedMin} 分钟）。/compact_queue_cancel 可撤销。` };
+		}
+		const count = messageCount();
+		if (belowMin(count)) {
+			return { kind: 'success', text: `当前历史消息 ${count} 条，不足 ${MIN_MESSAGES} 条，未压缩。` };
 		}
 		// 乐观排队后立刻试一次：busy 时队列已经就位，省去二次竞态判定。
 		state = 'queued';

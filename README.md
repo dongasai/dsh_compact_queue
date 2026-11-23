@@ -31,6 +31,7 @@ npm publish --registry https://registry.npmjs.org/ --access public
 | `/compact_queue_cancel` | 排队中 → 撤销；执行中 → abort 其 signal；auto 开着时连带关闭 |
 | 自动补跑 | 本会话下一次 idle 触发；`agent/status` 翻转与 2 秒兜底 tick 双通道，不漏触发、不重叠执行 |
 | 回执不吵人 | 后台完成/失败以折叠 notice 注入，不唤醒模型、不额外烧 token |
+| 最少 10 条才压 | 历史消息不足 10 条时，手动命令 / 排队补跑 / auto 三条路径都**跳过并给提示**（`当前历史消息 N 条，不足 10 条，未压缩。`），连摘要请求都不发 |
 | 失败不重试 | `ManualCompactionError` 除 `busy` 外一律终态，避免坏循环反复烧摘要请求 |
 | 排队按会话隔离 | 命令只注册一次；每个会话各自一份排队状态机，`/compact_queue_cancel` 只影响当前会话 |
 
@@ -66,7 +67,7 @@ dsh plugin --profile web add github:dongasai/dsh_compact_queue
 # 或
 dsh plugin --profile web add git+https://github.com/dongasai/dsh_compact_queue.git
 # 钉版本（URL 后加 #<tag>，锁到某个发布版本来复现问题 / 稳定使用）
-dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.5
+dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.6
 ```
 
 `dsh plugin --profile <name> <pnpm args>` 把参数交给
@@ -76,8 +77,8 @@ dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.5
 - `--profile` **必填**（不写直接报 `required option '--profile <name> not specified'`）。
 - **必须带 `git+` 或 `github:` 前缀**。`git@github.com:owner/repo.git` 这种 scp 写法不会被认成
   git spec，pnpm 会把它当路径，装出一条指向不存在目录的 `link:` 死链。
-- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.5`），tag / 分支 / commit 都行；
-  本仓库当前 tag 是 `0.5`，对应 `package.json` 的 `0.5.0` —— 不带 `#` 则跟 `main` 走，
+- **钉版本**：URL 后加 `#`（上面第三条命令就是钉 `0.6`），tag / 分支 / commit 都行；
+  本仓库当前 tag 是 `0.6`，对应 `package.json` 的 `0.6.0` —— 不带 `#` 则跟 `main` 走，
   每次装到的都可能是新代码。
 - pnpm 默认会拦 `prepare` 等依赖构建脚本；本包**没有任何构建步骤**（纯 ESM 源码 + 一个 cordis
   补丁，没有编译产物），不会遇到。
@@ -136,6 +137,10 @@ dsh plugin --profile web remove @dongasai/dsh-compact-queue
 | `/compact_queue_cancel` | 排队中 → 撤销；执行中 → abort；都没有 → 报「当前没有排队的压缩」；同时关掉 auto |
 | `/compact_queue <其它参数>` | 若客户端真把参数送进来，旧写法 `auto` / `~` / `cancel` 仍兼容；其余参数回用法提示 |
 
+**最少 10 条历史消息**：三种触发路径在调用核心 `compactNow` 之前都先数一遍
+`agent.session.surface.nodes.length`，不足 10 条就直接跳过并给提示，不产生摘要请求。核心本身
+2 条就肯压（首条是 system 消息时 3 条），这里主动抬高门槛，避免短会话白烧 token。
+
 一次典型交互（忙时）：
 
 ```
@@ -175,8 +180,9 @@ dsh ▸ 排队压缩完成：压缩了 42 条历史（约 18304 tokens）。    
 
 | 场景 | 原文 |
 | --- | --- |
-| 开启 | `已开启本会话自动压缩：每次会话回到空闲时压缩一次（压缩自身不会触发再次压缩）。/compact_queue_auto 可关闭。` |
+| 开启 | `已开启本会话自动压缩：每次会话回到空闲时压缩一次（历史不足 10 条会跳过，压缩自身不会触发再次压缩）。/compact_queue_auto 可关闭。` |
 | 关闭 | `已关闭本会话自动压缩。` |
+| 自动压跳过（不足 10 条） | `自动压缩跳过：当前历史消息 N 条，不足 10 条，未执行压缩。` |
 | 自动压成功 | `自动压缩完成：压缩了 N 条历史（约 M tokens）。` |
 | 自动压无历史 | `自动压缩检查：当前没有可压缩的历史。` |
 | 自动压失败 | `自动压缩失败：<原因>` |
@@ -191,14 +197,16 @@ dsh ▸ 排队压缩完成：压缩了 42 条历史（约 18304 tokens）。    
 | 忙、已排队（无限等待） | `会话正忙，压缩已排队：将在本会话下一次空闲时自动执行（无限等待，不设超时）。/compact_queue_cancel 可撤销。` |
 | 重复入队 | `压缩已在队列中（已排队约 N 分钟）。/compact_queue_cancel 可撤销。` |
 | 正在压缩 | `压缩正在执行中。` |
-| 开启 auto | `已开启本会话自动压缩：每次会话回到空闲时压缩一次（压缩自身不会触发再次压缩）。/compact_queue_auto 可关闭。` |
+| 开启 auto | `已开启本会话自动压缩：每次会话回到空闲时压缩一次（历史不足 10 条会跳过，压缩自身不会触发再次压缩）。/compact_queue_auto 可关闭。` |
 | 关闭 auto | `已关闭本会话自动压缩。` |
 | 撤销排队 | `已撤销排队的压缩。`；若 auto 开着则 `已撤销排队的压缩，并关闭自动压缩。` |
 | 取消执行中 | `正在取消执行中的压缩。`；若 auto 开着则 `正在取消执行中的压缩，并关闭自动压缩。` |
 | 撤销空操作 | `当前没有排队的压缩。`；若 auto 开着则 `已关闭自动压缩（当前没有排队的压缩）。` |
 | 参数不对（旧客户端） | `可用命令：/compact_queue（排队或立即压缩）· /compact_queue_unlimited（无限等待）· /compact_queue_auto（切换本会话自动压缩）· /compact_queue_cancel（撤销）` |
+| 手动压缩不足 10 条 | `当前历史消息 N 条，不足 10 条，未压缩。` |
 | 预设缺服务 | `本会话挂载的 agent preset 没有提供 compaction 服务，无法压缩。` |
 | 排队补跑成功 | `排队压缩完成：压缩了 N 条历史（约 M tokens）。` |
+| 排队补跑跳过（不足 10 条） | `排队压缩跳过：当前历史消息 N 条，不足 10 条，本次未执行。` |
 | 排队补跑无历史 | `排队压缩完成前检查：当前没有可压缩的历史。` |
 | 排队补跑失败 | `排队压缩失败：<原因>` |
 | 排队超时 | `/compact_queue 排队超时（等待超过 24 小时，会话一直未空闲），本次压缩已取消。` |
@@ -257,10 +265,11 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 | `/compact_queue_auto` 等命令被当成普通消息发给模型 | 运行中的实例在装 0.5 前就启动了、没重启；或 bundle 没被选中 | 重启 dsh 服务；再敲 `/` 看补全菜单有没有 `compact_queue_auto`。**DSH 命令不接受参数**：`/compact_queue auto` 这种写法一定会变普通消息，必须用无参命令 `/compact_queue_auto` |
 | 一直回「已排队」不下去 | 会话确实一直被占用（长任务、subagent、其它 maintenance 占着） | 等本轮结束；或 `/compact_queue_cancel` 撤销 |
 | auto 开着但一次都没自动压 | 会话没有产生 idle 翻转（一直 running），或还没发过新消息 | 让一轮 AI 正常结束；auto 只在回 idle 时触发，且不会自己触发自己 |
+| 回「当前历史消息 N 条，不足 10 条」 | 本会话 surface 历史不够，门槛拦截，未发摘要请求 | 继续对话攒到 10 条；这是刻意省 token 的门槛，不是故障 |
 | 回「本会话挂载的 agent preset 没有提供 compaction 服务」 | 当前 preset 没挂 compaction 实现 | 换回带压缩的 preset；这不是排队逻辑的问题 |
 | 排队到 24 小时突然消失、没有任何提示 | tick 通道命中超时的已知静默缺陷 | 用 `/compact_queue_unlimited` 排队可绕过超时；详见「已知边界」第 3 条 |
-| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.5` |
-| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.5`） |
+| 装完报「找不到包」 | git 规格写成 `git@…` scp 写法，被当成本地路径 | 改成 `github:dongasai/dsh_compact_queue#0.6` |
+| 报 tag 不存在 | 钉了未发布的版本 | `git ls-remote --tags origin` 选真实 tag（当前 `0.6`） |
 
 ## 怎么验证
 
@@ -270,7 +279,7 @@ Host 半边 `inject: ['commands', 'agents', 'agentPresets']` —— 要宿主层
 node --check index.js                                        # 语法：无输出即通过
 npm pack --dry-run                                           # 应恰好 4 个文件（index.js / cordis.patch.yml / package.json / README.md）
 grep -n 'dsh-compact-queue' ~/.dsh/profiles/web/package.json  # 两行：dependencies + dsh.profile.bundles（安装时自动登记）
-git ls-remote --tags origin                                  # 当前应看到 0.1、0.2、0.3、0.4、0.5 及各自指向的提交
+git ls-remote --tags origin                                  # 当前应看到 0.1、0.2、0.3、0.4、0.5、0.6 及各自指向的提交
 dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # 期望三行，见「装完确认」
 ```
 
@@ -285,6 +294,7 @@ dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # �
 7. auto 开着时 `/compact_queue_cancel` → 回执带「并关闭自动压缩」，之后再结束一轮不再自动压
 8. 两个会话分别开 auto：A 开不影响 B；重启后 auto 默认关闭
 9. 关掉该会话 → 后台无残留定时器、无 unhandled rejection（看宿主日志）
+10. 历史不足 10 条时敲 `/compact_queue`、或开着 auto 结束一轮 → 回「不足 10 条」提示，且不产生摘要请求（看宿主日志无摘要调用）
 
 ## 已知边界
 
@@ -297,12 +307,13 @@ dsh --profile web --dump-config | grep -A1 dsh-compact-queue                 # �
 7. **auto 下 busy 只跳过、不重试**。会话被占用时那次 idle 翻转白白错过，要等下一次轮次结束才压；这是刻意的——不排队就没有超时/静默取消那类问题，也不会自己烧摘要请求。
 8. **`attempt()` 开头重复调用 `isLive()`**，属无害死代码（AGENTS.md 的已知问题清单里也记着）。
 9. **无自动化测试**。状态机与定时器只能手验，验证清单见上一节。
+10. **10 条门槛只数 surface 节点**（含 system 消息头）；核心实际可压范围还要去掉 system 头、保留最后一个节点，所以 10 条时最多压 9 条（有 system 头时 8 条）。门槛写死为 `MIN_MESSAGES = 10`，没有配置项；要改得动源码。
 
 ## 发版
 
-- 当前版本：`package.json` 的 `0.5.0` ↔ 附注 tag `0.5`（**不带 `v`**，延续 `0.1` / `0.2` / `0.3` 的命名）
+- 当前版本：`package.json` 的 `0.6.0` ↔ 附注 tag `0.6`（**不带 `v`**，延续 `0.1` / `0.2` / `0.3` 的命名）
 - 远端：`origin` = `git@github.com:dongasai/dsh_compact_queue.git`
-- 流程：改 `package.json.version` → `git tag -a 0.5 -m …` → **`git push origin main` 与 `git push origin 0.5` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
+- 流程：改 `package.json.version` → `git tag -a 0.6 -m …` → **`git push origin main` 与 `git push origin 0.6` 两条都推**（只推分支会漏 tag，克隆方拉不到对应版本）
 
 ## 相关文件
 

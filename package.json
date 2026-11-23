@@ -1,11 +1,11 @@
 {
   "name": "@dongasai/dsh-compact-queue",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "type": "module",
-  "description": "Host-registered /compact_queue command family (4 no-arg commands) with per-agent queues: runs compaction now when idle, otherwise queues it and fires on the next idle window (core /compact only reports busy).",
+  "description": "Host-registered /compact_queue command family (4 no-arg commands) with per-agent queues: runs compaction now when idle (skips with a notice when history has fewer than 10 messages), otherwise queues it and fires on the next idle window (core /compact only reports busy).",
   "meta": {
     "title": "压缩排队 compact_queue",
-    "description": "注册四条无参命令 /compact_queue[_unlimited|_auto|_cancel]，按 mode + invocation.agent 分流到各会话自己的排队状态机：空闲时立即压缩，忙时排队，等本会话下一次空闲自动补跑；完成后以 notice 注入回执，不伪装成用户消息、不额外唤醒模型。核心 /compact 不改。"
+    "description": "注册四条无参命令 /compact_queue[_unlimited|_auto|_cancel]，按 mode + invocation.agent 分流到各会话自己的排队状态机：空闲时立即压缩，忙时排队，等本会话下一次空闲自动补跑；历史不足 10 条时三条路径都跳过并给提示，不烧摘要请求；完成后以 notice 注入回执，不伪装成用户消息、不额外唤醒模型。核心 /compact 不改。"
   },
   "exports": {
     ".": "./index.js",

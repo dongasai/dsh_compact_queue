@@ -19,6 +19,8 @@
 
 **命令必须无参**：DSH 的斜杠命令输入 UX 只认命令名，带空格的 `/compact_queue auto` 会被整段当成普通消息发给模型（`parseCommand` 虽解析 `rawInput`，但前端不送参数）。四种动作各占一个命令名；handler 保留对旧参数写法的兼容，但那不是主路径。
 
+**最少 10 条才压**：三条触发路径（手动命令、排队补跑、auto）在调用 `compactNow` 前都先数一遍 `agent.session.surface.nodes.length`，不足 `MIN_MESSAGES`（10）就跳过并回执提示，不发摘要请求。核心本身 2 条就肯压（首条是 system 消息时 3 条），这里主动抬高门槛省 token；门槛只在插件侧，核心没改。
+
 三条设计红线：
 
 1. **不改核心**。核心 `/compact`（`@deepseek-ai/dsh-command-compact`）在非严格 idle 时只回一句
@@ -42,6 +44,7 @@ apply(ctx)                            ← 宿主 ctx，拿得到 agents / agentP
                         attach(ctx, agent)          ← 每个 agent 一份状态机，监听/定时器挂在 agent.ctx
                           ├─ 状态机 state: none | queued | running（+ running 布尔锁）
                           ├─ autoEnabled 布尔（auto 开关，重启即关，只在本会话内存）
+                          ├─ MIN_MESSAGES 门槛：三路径共用 messageCount()，不足 10 条跳过并提示
                           ├─ 返回该 agent 的 runCommand(mode)，四条无参命令共用，按 mode + invocation.agent 分派
                           ├─ agent.ctx.on('agent/status') → idle 翻转时 attempt(true) 或 autoCompact()
                           ├─ setInterval(2s).unref()      → attempt(false)   ← 兜底 tick（auto 不启动）
@@ -72,7 +75,7 @@ busy 时只跳过本次，不排队重试。autoEnabled 与排队状态共用 `r
 
 ```mermaid
 graph TD
-    A["(根) dsh_compact_queue<br/>@dongasai/dsh-compact-queue 0.5.0"] --> B["index.js<br/>宿主插件（唯一源码）"]
+    A["(根) dsh_compact_queue<br/>@dongasai/dsh-compact-queue 0.6.0"] --> B["index.js<br/>宿主插件（唯一源码）"]
     A --> C["cordis.patch.yml<br/>bundle 补丁：宿主层一行 insert"]
     A --> D["package.json<br/>exports / files / dsh.bundle"]
     A --> E["README.md<br/>用法·状态机·失败映射"]
@@ -108,7 +111,7 @@ graph TD
 
 | 目的 | 做法 |
 |---|---|
-| 装进 profile | 三条通路：Web 插件页「添加插件」→ 点「立即启用」；`dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.5`；`link:<仓库绝对路径>`。`dsh plugin` 走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 把声明了 `dsh.bundle` 的包自动选进 `dsh.profile.bundles`，**不需要手写注册行**。当前 web profile 是 `"@dongasai/dsh-compact-queue": "link:/data/ai/dsh/dsh_compact_queue"`（2026-11-22 由 `#0.2` 副本切过来）。**`link:` 坑**：DSH 按真身目录解析裸导入 `@deepseek-ai/*`，仓库里要放 `node_modules/@deepseek-ai` 符号链接指向 npx 安装内同名目录（本机已建，并用 `.git/info/exclude` 排除，不进版本库），否则启动报 `ERR_MODULE_NOT_FOUND`、bundle 激活失败；git 源 / tarball 装出来的是真实目录，没有这个坑 |
+| 装进 profile | 三条通路：Web 插件页「添加插件」→ 点「立即启用」；`dsh plugin --profile web add github:dongasai/dsh_compact_queue#0.6`；`link:<仓库绝对路径>`。`dsh plugin` 走 `@deepseek-ai/dsh-plugin-manager/operations`，装完由 `reconcile()` 把声明了 `dsh.bundle` 的包自动选进 `dsh.profile.bundles`，**不需要手写注册行**。当前 web profile 是 `"@dongasai/dsh-compact-queue": "link:/data/ai/dsh/dsh_compact_queue"`（2026-11-22 由 `#0.2` 副本切过来）。**`link:` 坑**：DSH 按真身目录解析裸导入 `@deepseek-ai/*`，仓库里要放 `node_modules/@deepseek-ai` 符号链接指向 npx 安装内同名目录（本机已建，并用 `.git/info/exclude` 排除，不进版本库），否则启动报 `ERR_MODULE_NOT_FOUND`、bundle 激活失败；git 源 / tarball 装出来的是真实目录，没有这个坑 |
 | 卸载 | `dsh plugin --profile web remove @dongasai/dsh-compact-queue`；`reconcile()` 会把它从 `dsh.profile.bundles` 一并摘掉，重启后命令消失 |
 | 让改动生效 | **重启 `dsh web`**。命令在 `apply()` 里注册四条；模块按已解析 URL 进 ESM 缓存，`plugin_manager` 关→开**不会**重新 import，热改一律不生效。没有浏览器半边，不需要 `pnpm run dev:web` 之类的重建。验证装对了：`dsh --profile web --no-open --port 0` 起一个临时实例，看它能否加载该行，再杀掉，别动正在跑的服务 |
 | 手工冒烟 | 在 dsh web 会话里敲 `/compact_queue` 看回执；忙时再敲一次应回「已排队」并在下一次 idle 自动补跑（摘要以折叠 notice 出现） |
@@ -127,6 +130,7 @@ timer 逻辑时至少覆盖这五条：
 6. **auto 不递归**：`/compact_queue_auto` 开 → 每轮结束一条 `自动压缩完成：` notice；**不敲新消息不再出第二条**（关键：验证 compression 自身没触发自己）。
 7. **auto 撤销/隔离**：auto 开着时 `/compact_queue_cancel` → 回执带「并关闭自动压缩」，之后不再自动压；两会话分别开 auto 互不影响；重启后 auto 默认关。
 8. **命令名拦截**：四条命令在 `/` 补全菜单里都能出现，且敲下去都被拦截（不变成普通消息发给模型）。
+9. **10 条门槛**：手动命令 / 排队补跑 / auto 在历史不足 10 条时都回「不足 10 条」提示，且 `compactNow` 一次都不调用；攒到 10 条后正常压缩。
 
 无可用压缩范围时 `compactNow` 返回 `null`，按终态成功处理（「当前没有可压缩的历史」），不重试——
 这是刻意口径，不是 bug。`ManualCompactionError` 除 `busy` 外全部终态，避免坏循环烧摘要请求。
@@ -137,8 +141,9 @@ timer 逻辑时至少覆盖这五条：
 - 注释写**为什么**（哪个官方接缝、哪条源码注释支撑），不写「这里做了什么」的复述；文件头用编号小节承载设计决策。
 - 用户可见文案一律中文，且与核心 `/compact` 的失败口径对齐（`FAILURE_TEXT` 逐条映射 `ManualCompactionError.code`）。
 - 新增/修改回执必须保持 `form: 'notice'`；任何时候都不得把系统回执标成 `kind: 'user'`。
-- 常量集中在文件头（`QUEUE_TICK_MS`、`MAX_WAIT_MS`、`MAX_WAIT_TEXT`），文案常量（`USAGE`、`AUTO_ON_TEXT`、`AUTO_OFF_TEXT`、`FAILURE_TEXT`）放在函数之前；`/compact_queue_unlimited` 的无限等待由 `unlimited` 布尔控制，跳过 `MAX_WAIT_MS` 判定。
+- 常量集中在文件头（`QUEUE_TICK_MS`、`MAX_WAIT_MS`、`MAX_WAIT_TEXT`、`MIN_MESSAGES`），文案常量（`USAGE`、`AUTO_ON_TEXT`、`AUTO_OFF_TEXT`、`FAILURE_TEXT`）放在函数之前；`/compact_queue_unlimited` 的无限等待由 `unlimited` 布尔控制，跳过 `MAX_WAIT_MS` 判定。
 - auto 通道与排队通道共用 `running` 锁与 `activeAbort`：处理 auto 时先判 `state !== 'none'` 让排队优先，busy 只跳过不排队；新增触发通道必须同时核对「不重叠」与「不递归」两条。
+- **10 条门槛的判定要三条路径都加**：`messageCount()` 读 `agent.session.surface.nodes.length`（拿不到返回 `null`，不拦截，交给核心）；手动命令在置 `queued` 前、排队补跑在超时判定后、`autoCompact()` 在 `running` 检查后各判一次。三条路径的跳过都要给提示——手动走 CommandResult 文本，另两条走 `notify()` notice。别只改一条路径。
 
 ## AI 使用指引
 
@@ -148,11 +153,12 @@ timer 逻辑时至少覆盖这五条：
 - **别顺手"优化"乐观排队**：handler 先置 `queued` 再立刻试一次是刻意设计——省掉二次竞态判定，代价只是忙时多一次无副作用调用。
 - **别给 auto 补 tick 兜底**：auto 的"不递归"完全依赖 maintenance 不发 idle 事件；一旦给它加轮询/排队，压缩自己就会触发下一次压缩，变成无限烧摘要请求。busy 跳过本次是刻意的。
 - **两条已知问题在 README 末尾有账**：① tick 通道命中 24 小时超时是静默取消（`attempt(false)` 不发 notice，`/compact_queue_unlimited` 排队不设超时可绕过）；② `attempt()` 开头连续两次 `isLive()` 属死代码。修任一条要同步更新 README 的「已知边界」。
-- **发版口径**：`package.json.version` 与 tag 同步（当前 `0.5.0` ↔ 附注 tag `0.5`，不带 `v`，与 `gitea_task_issues` 一致）；远端 `origin` = `git@github.com:dongasai/dsh_compact_queue.git`，发版＝本地提交 → `git tag -a 0.5 -m …` → `git push origin main` 与 `git push origin 0.5` 两条都推（只推分支会丢 tag）。直连 GitHub 超时，用 SOCKS5 代理：`GIT_SSH_COMMAND="ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' ssh" git push origin main`。
+- **发版口径**：`package.json.version` 与 tag 同步（当前 `0.6.0` ↔ 附注 tag `0.6`，不带 `v`，与 `gitea_task_issues` 一致）；远端 `origin` = `git@github.com:dongasai/dsh_compact_queue.git`，发版＝本地提交 → `git tag -a 0.6 -m …` → `git push origin main` 与 `git push origin 0.6` 两条都推（只推分支会丢 tag）。直连 GitHub 超时，用 SOCKS5 代理：`GIT_SSH_COMMAND="ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' ssh" git push origin main`。
 - 提交信息沿用 `类型(范围): 中文描述`（已落地的两条：`功能(压缩排队):`、`文档(接入):`）。
 
 ## 变更记录
 
+- **2026-11-24T01:30+08:00** 新增**最少 10 条历史消息门槛**（用户定 N=10，并强调「没压缩也要有提示」）：`MIN_MESSAGES = 10`，`attach()` 加 `messageCount()`（读 `agent.session.surface.nodes.length`，拿不到返回 `null` 不拦截）/ `belowMin()`。三条路径各加一次判定：手动命令在置 `queued` 前返回 `当前历史消息 N 条，不足 10 条，未压缩。`；排队补跑 `attempt()` 在超时判定后 `stopQueue()` 并发 notice `排队压缩跳过：当前历史消息 N 条，不足 10 条，本次未执行。`（tick 通道也发，用户要提示）；`autoCompact()` 在 `running` 检查后发 notice `自动压缩跳过：…`。notice 不唤醒模型，不递归。核心 `compactNow` 未改（它 2 条就肯压，门槛只在插件侧）。`AUTO_ON_TEXT` 同步加门槛说明。README / AGENTS / `.agents/index.json` 同步功能表、回执表、排错、验证、已知边界与版本到 0.6。本地 `node --check` + fake-ctx 模拟四路径：9 条时三路径都提示且 `compactNow` 零调用，20 条时正常压缩。
 - **2026-11-22T13:45+08:00** 命令改为**无参命令族**：用户实测 DSH 的斜杠命令输入框不接受参数（`/compact_queue auto` 整段被当普通消息发给模型），尽管后端 `parseCommand` 会解析 `rawInput`。`apply()` 由注册一条改为注册四条无参命令：`/compact_queue`、`/compact_queue_unlimited`、`/compact_queue_auto`、`/compact_queue_cancel`，共用 handler 按 `mode` + `invocation.agent` 分派；`runCommand(mode, invocation)` 保留旧参数写法兼容。README / AGENTS / `.agents/index.json` 同步命令名、排错口径、版本到 0.5。本机 web profile 从 `#0.2` 副本切到 `link:` 安装；为修 `ERR_MODULE_NOT_FOUND`，仓库内加了 `node_modules/@deepseek-ai` 符号链接（`.git/info/exclude` 排除）。`node --check` 与本地模拟注册验证四条命令全部注册；13:49 重启 dsh，宿主日志无 `ERR_MODULE_NOT_FOUND` / bundle 激活失败。发版 `0.5`：提交 `8316264`，附注 tag `0.5` 指向同一提交，`git push origin main` 与 `git push origin 0.5` 经 SOCKS5 代理推送成功，`git ls-remote` 核对远端 main = `8316264`、`0.5^{}` = `8316264`。
 - **2026-11-22T12:10+08:00** 新增 `/compact_queue auto`（每次空闲自动压缩，仅限当前会话，不递归）：`attach()` 增 `autoEnabled` 布尔，新增 `autoCompact()` 只由 `agent/status` 的 idle 翻转调用（不启动 tick、不排队，靠 maintenance 不发事件 + notice `wakeup=false` 保证不递归）；`cancel` 连带关 auto；`dispose` 清 autoEnabled。USAGE 加 auto、新增 `AUTO_ON_TEXT`/`AUTO_OFF_TEXT`，命令 description 更新。README（功能/用法/auto 专节/回执/排错/验证/已知边界）与本文件（愿景/架构图/双通道/模块图/测试/编码规范/AI 指引）同步更新。已纳入 `0.4`（已推送到 origin）；本机 web profile 仍指向 0.2 副本，需切依赖 + 重启才生效。
 - **2026-11-22T12:15+08:00** 发版 `0.4`：承接上条的 `/compact_queue auto`，`package.json.version` → `0.4.0`，附注 tag `0.4` 指向提交 `a3d19c2`。README / AGENTS / `.agents/index.json` 的版本号、钉版本示例、发版口径、tag 清单同步到 0.4。直连 GitHub 的 SSH(22)/HTTPS(443) 超时，改走本地 SOCKS5 代理 `socks5h://127.0.0.1:1080`（`GIT_SSH_COMMAND` 里配 `nc -X 5 -x` 的 ProxyCommand）后，`git push origin main` 与 `git push origin 0.4` 均成功；`git ls-remote` 核对远端 main 与 `0.4^{}` 都是 `a3d19c2`。本机 web profile 仍指向 `#0.2`，未随发版切换（切依赖 + 重启是独立动作）。

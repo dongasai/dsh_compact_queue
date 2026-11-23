@@ -5,13 +5,13 @@
   "repo": {
     "root": ".",
     "name": "@dongasai/dsh-compact-queue",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "kind": "dsh-bundle-plugin",
     "vcs": {
       "type": "git",
       "branch": "main",
-      "head": "见 git log -1（0.5 附注 tag 指向该发行提交）",
-      "tags": ["0.1", "0.2", "0.3", "0.4", "0.5"],
+      "head": "见 git log -1（0.6 附注 tag 指向该发行提交）",
+      "tags": ["0.1", "0.2", "0.3", "0.4", "0.5", "0.6"],
       "remotes": [
         { "name": "origin", "url": "git@github.com:dongasai/dsh_compact_queue.git" }
       ]
@@ -77,7 +77,7 @@
       ],
       "injects": ["commands", "agents", "agentPresets"],
       "externalServices": ["ctx.agents", "ctx.agentPresets.serviceFor(agent,'compaction')", "agent.inject", "ctx.logger"],
-      "constants": { "QUEUE_TICK_MS": 2000, "MAX_WAIT_MS": 86400000 },
+      "constants": { "QUEUE_TICK_MS": 2000, "MAX_WAIT_MS": 86400000, "MIN_MESSAGES": 10 },
       "stateMachine": ["none", "queued", "running"],
       "tests": { "present": false, "dirs": [], "framework": null },
       "quality": { "eslint": false, "prettier": false, "other": [] },
@@ -101,6 +101,6 @@
   "nextSteps": [
     "为状态机补最小冒烟脚本或探针（排队/撤销/超时/agent 离场四条路径）",
     "修 tick 超时静默取消：超时分支应不分通道都发 notice",
-    "核对远端：main 与 tag 0.5 都要在 origin 上（git ls-remote --tags）"
+    "核对远端：main 与 tag 0.6 都要在 origin 上（git ls-remote --tags）"
   ]
 }
